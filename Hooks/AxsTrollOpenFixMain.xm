@@ -11,8 +11,34 @@
 //    反向命中时关闭该浮窗（对应 TrollOpenJB 的 fullscreenCallbackAutoCloseFloatingEnabled）。
 // 2) 小窗贴边：TOJBClass012 进入小窗模式或拖动停下后，自动吸附到最近的屏幕左右边缘。
 
-#define AXS_TROLLOPEN_FIX_LOG(msg) \
-    NSLog(@"[TrollOpenFix] %@", (msg))
+// 文件日志：手机端 syslog 工具不一定能抓到 NSLog，直接落盘到 Filza 可读的位置。
+static void axs_trollopenfix_writeLog(NSString *msg) {
+    @try {
+        static NSString *path;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            path = @"/var/mobile/TrollOpenJB/trollfix.log";
+        });
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"MM-dd HH:mm:ss.SSS";
+        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], msg];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } else {
+            [line writeToFile:path atomically:YES];
+        }
+    } @catch (NSException *e) {
+        // 日志失败不影响功能。
+    }
+}
+
+#define AXS_TROLLOPEN_FIX_LOG(msg) do { \
+    NSLog(@"[TrollOpenFix] %@", (msg)); \
+    axs_trollopenfix_writeLog([NSString stringWithFormat:@"%@", (msg)]); \
+} while (0)
 
 #pragma mark - 开关
 
@@ -626,6 +652,8 @@ static void axs_trollopenfix_new_didSelect(id self, SEL _cmd, id tableView, id i
                     if ([item isKindOfClass:[NSDictionary class]]) {
                         NSNumber *type = item[@"type"];
                         BOOL changeable = ((BOOL(*)(id, SEL, id))objc_msgSend)(self, canSel, item);
+                        AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"didSelect type=%@ changeable=%d identifier=%@",
+                                               type, changeable, item[@"identifier"]]));
                         if (changeable && type && type.unsignedIntValue < 4) {
                             NSString *identifier = item[@"identifier"];
                             NSString *title = item[@"title"];
@@ -686,6 +714,7 @@ static void axs_trollopenfix_new_didFinishPicking(id self, SEL _cmd, id picker, 
     NSNumber *stored = objc_getAssociatedObject(self, &axs_trollopenfix_pendingChoiceKey);
     if (stored) choice = stored.integerValue;
     objc_setAssociatedObject(self, &axs_trollopenfix_pendingChoiceKey, nil, OBJC_ASSOCIATION_RETAIN);
+    AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"didFinishPicking choice=%ld", (long)choice]));
 
     if (choice != AxsTrollOpenFixIconChoiceNormal) {
         // 状态图标：直接落盘 on-/off- 文件，不进入普通图标保存流程。
@@ -718,17 +747,25 @@ static void axs_trollopenfix_new_didFinishPicking(id self, SEL _cmd, id picker, 
 
 static void axs_trollopenfix_hookPrefsIconFlow(void) {
     Class listCls = objc_getClass("TOJFanMenuListController");
-    if (!listCls) return;
+    if (!listCls) {
+        AXS_TROLLOPEN_FIX_LOG(@"TOJFanMenuListController not found in this process");
+        return;
+    }
     SEL sel1 = @selector(tableView:didSelectRowAtIndexPath:);
     IMP imp1 = axs_trollopenfix_replaceOwnMethod(listCls, sel1, (IMP)axs_trollopenfix_new_didSelect);
     if (imp1) {
         axs_trollopenfix_orig_didSelect = (void (*)(id, SEL, id, id))imp1;
+        AXS_TROLLOPEN_FIX_LOG(@"prefs didSelect hooked");
+    } else {
+        AXS_TROLLOPEN_FIX_LOG(@"prefs didSelect hook failed");
     }
     SEL sel2 = @selector(imagePickerController:didFinishPickingMediaWithInfo:);
     IMP imp2 = axs_trollopenfix_replaceOwnMethod(listCls, sel2, (IMP)axs_trollopenfix_new_didFinishPicking);
     if (imp2) {
         axs_trollopenfix_orig_didFinishPicking = (void (*)(id, SEL, id, id))imp2;
-        AXS_TROLLOPEN_FIX_LOG(@"prefs icon flow hooked");
+        AXS_TROLLOPEN_FIX_LOG(@"prefs didFinishPicking hooked");
+    } else {
+        AXS_TROLLOPEN_FIX_LOG(@"prefs didFinishPicking hook failed");
     }
 }
 
@@ -737,6 +774,9 @@ static void axs_trollopenfix_hookPrefsIconFlow(void) {
 %ctor {
     @autoreleasepool {
         [AxsTrollOpenFixConfig axs_trollopenfix_shared];
+        BOOL inSettings = objc_getClass("TOJFanMenuListController") != nil;
+        AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"ctor loaded in %@",
+                               inSettings ? @"Settings (TrollOpen prefs present)" : @"SpringBoard/other"]));
         dispatch_async(dispatch_get_main_queue(), ^{
             // 等 TrollOpen 完成自身初始化后再挂接。
             axs_trollopenfix_hookFloatingWindowClass();
