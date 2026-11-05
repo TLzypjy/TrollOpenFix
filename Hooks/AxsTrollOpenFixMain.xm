@@ -526,7 +526,7 @@ static NSString *axs_trollopenfix_sanitized(NSString *s) {
 // 由偏好面板侧写入；菜单图标重载完成后按 stateEnabled 换上对应状态图。
 
 // 检测系统工具当前状态（对应已知工具类型）。
-static BOOL axs_trollopenfix_toolIsOn(NSString *identifier) {
+__attribute__((unused)) static BOOL axs_trollopenfix_toolIsOn(NSString *identifier) {
     // 屏幕录制：RPScreenRecorder.isRecording
     if ([identifier hasPrefix:@"ScreenRecord"]) {
         Class cls = objc_getClass("RPScreenRecorder");
