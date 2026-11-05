@@ -2,6 +2,8 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach-o/dyld.h>
+#import <dlfcn.h>
+#import <string.h>
 #import <substrate.h>
 #import "AxsTrollOpenFixConfig.h"
 #import "AxsTrollOpenFixPrivate.h"
@@ -576,10 +578,11 @@ static void axs_trollopenfix_applyMenuStateIcons(id manager) {
     }
 }
 
-// TrollOpenJB.dylib 内图标重载函数的文件偏移（1.5.2+offline.5 arm64e 切片）。
-#define AXS_TROLLOPEN_FIX_ICON_RELOAD_OFFSET 0x5f8ca4ull
-// 期望的函数前 8 字节（stp d15,d14,[sp,#-0xa0]! / stp d13,d12,[sp,#0x10]），校验失败则不挂钩，防版本漂移误伤。
-static const uint8_t axs_trollopenfix_iconReloadPrologue[8] = {0xef, 0x3b, 0xb6, 0x6d, 0xed, 0x33, 0x01, 0x6d};
+// TrollOpenJB.dylib 内图标重载函数的偏移。运行时加载的是 arm64e 切片（fat 的
+// sub=0x80000002），偏移按该切片计算；arm64 切片(0x5f8ca4)与 arm64e(0x610ad0)不同。
+#define AXS_TROLLOPEN_FIX_ICON_RELOAD_OFFSET 0x610ad0ull
+// 期望的函数前 8 字节：pacibsp + stp d15,d14,[sp,#-0xa0]!。校验失败则不挂钩，防版本漂移误伤。
+static const uint8_t axs_trollopenfix_iconReloadPrologue[8] = {0x7f, 0x23, 0x03, 0xd5, 0xef, 0x3b, 0xb6, 0x6d};
 
 static void (*axs_trollopenfix_orig_iconReload)(void *self, void *cmd);
 static void axs_trollopenfix_new_iconReload(void *self, void *cmd) {
@@ -746,11 +749,14 @@ static void axs_trollopenfix_new_didFinishPicking(id self, SEL _cmd, id picker, 
 }
 
 static void axs_trollopenfix_hookPrefsIconFlow(void) {
+    static BOOL attempted = NO;
+    if (attempted) return; // 只挂一次，避免重复 hook 套娃
     Class listCls = objc_getClass("TOJFanMenuListController");
     if (!listCls) {
-        AXS_TROLLOPEN_FIX_LOG(@"TOJFanMenuListController not found in this process");
+        AXS_TROLLOPEN_FIX_LOG(@"TOJFanMenuListController not loaded yet");
         return;
     }
+    attempted = YES;
     SEL sel1 = @selector(tableView:didSelectRowAtIndexPath:);
     IMP imp1 = axs_trollopenfix_replaceOwnMethod(listCls, sel1, (IMP)axs_trollopenfix_new_didSelect);
     if (imp1) {
@@ -769,20 +775,34 @@ static void axs_trollopenfix_hookPrefsIconFlow(void) {
     }
 }
 
+// 偏好面板的类是懒加载：进 TrollOpen 面板时 TrollOpenJBPrefs.bundle 才载入，
+// 因此监听镜像加载事件，等 bundle 出现再挂钩。
+static void axs_trollopenfix_imageAdded(const struct mach_header *mh, intptr_t slide) {
+    #pragma unused(slide)
+    Dl_info info;
+    if (!mh || !dladdr(mh, &info) || !info.dli_fname) return;
+    if (!strstr(info.dli_fname, "TrollOpenJBPrefs.bundle")) return;
+    AXS_TROLLOPEN_FIX_LOG(@"TrollOpenJBPrefs.bundle loaded");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        axs_trollopenfix_hookPrefsIconFlow();
+    });
+}
+
 #pragma mark - 入口
 
 %ctor {
     @autoreleasepool {
         [AxsTrollOpenFixConfig axs_trollopenfix_shared];
-        BOOL inSettings = objc_getClass("TOJFanMenuListController") != nil;
-        AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"ctor loaded in %@",
-                               inSettings ? @"Settings (TrollOpen prefs present)" : @"SpringBoard/other"]));
+        NSString *proc = [NSBundle mainBundle].bundleIdentifier ?: @"?";
+        AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"ctor loaded in %@", proc]));
         dispatch_async(dispatch_get_main_queue(), ^{
             // 等 TrollOpen 完成自身初始化后再挂接。
             axs_trollopenfix_hookFloatingWindowClass();
             axs_trollopenfix_hookRouteMethods();
             axs_trollopenfix_hookMenuIconReload();
+            // 先试一次（bundle 可能已加载），再注册镜像加载监听兜底懒加载。
             axs_trollopenfix_hookPrefsIconFlow();
+            _dyld_register_func_for_add_image(axs_trollopenfix_imageAdded);
         });
     }
 }
