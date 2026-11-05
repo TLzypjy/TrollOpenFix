@@ -221,8 +221,7 @@ static void axs_trollopenfix_processRoutePair(NSString *source, NSString *target
 
 #pragma mark - 路由事件提取
 
-static void axs_trollopenfix_handleRouteEvent(id request, id options, id activationSettings,
-                                              id origin, id urlCandidate) {
+static void axs_trollopenfix_handleRouteEvent(id request, id options, id activationSettings, id origin) {
     if (!axs_trollopenfix_enabled()) return;
 
     NSString *source = axs_trollopenfix_extractBundleID(origin);
@@ -232,15 +231,6 @@ static void axs_trollopenfix_handleRouteEvent(id request, id options, id activat
     if (!source) source = axs_trollopenfix_extractBundleID(options);
     NSString *target = axs_trollopenfix_extractBundleID(request);
     if (!target) target = axs_trollopenfix_extractBundleID(activationSettings);
-
-    // 事件带 URL（多为应用回调 openURL）：记录 URL 字符串供日志定位。
-    NSString *urlString = nil;
-    id u = axs_trollopenfix_safeGet(request, @"URL") ?: axs_trollopenfix_safeGet(request, @"url");
-    if ([u isKindOfClass:[NSURL class]]) urlString = [(NSURL *)u absoluteString];
-    else if ([u isKindOfClass:[NSString class]]) urlString = u;
-    if (urlCandidate && !urlString) {
-        urlString = [urlCandidate isKindOfClass:[NSURL class]] ? [(NSURL *)urlCandidate absoluteString] : nil;
-    }
 
     // 目标缺失时用 0.8s 后的前台应用（跳转完成后目标必然在前台）。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
@@ -418,27 +408,42 @@ static void axs_trollopenfix_hookFloatingWindowClass(void) {
 
 #pragma mark - SpringBoard 路由 hook
 
-static void (*axs_trollopenfix_orig_handleOpenRequest)(id, SEL, id, id, id, id, id);
-static void (*axs_trollopenfix_orig_openURLCore)(id, SEL, id, id, id, id, id, id);
+static void (*axs_trollopenfix_orig_handleOpenRequest)(void *, void *, void *, void *, void *, void *, void *);
+static void (*axs_trollopenfix_orig_openURLCore)(void *, void *, void *, void *, void *, void *, void *, void *);
 
-static void axs_trollopenfix_new_handleOpenRequest(id self, SEL _cmd, id request, id options,
-                                                   id activationSettings, id origin, id withResult) {
-    // wrapper 不持有任何跨 %orig 的强引用对象：若异常穿过本栈帧，
-    // 清理路径无可释放对象，杜绝 objc_retain/release 踩到非法值。
-    axs_trollopenfix_orig_handleOpenRequest(self, _cmd, request, options, activationSettings, origin, withResult);
+// 指针合理性粗检：排除 0x1 这类明显不是对象副本的值。
+// 三次真机崩溃样本显示 %orig 调用链执行期间，保存在 callee-saved 寄存器里的
+// 参数指针可能被破坏（EXC_BAD_ACCESS objc_retain/release 0x1），因此：
+// 1) wrapper 参数一律用 void*（无 ARC retain/release，清理路径零操作）；
+// 2) 任何参数在作为对象使用前先做合理性检查。
+static BOOL axs_trollopenfix_plausibleObject(void *p) {
+    return (uintptr_t)p > 0x100000;
+}
+
+static void axs_trollopenfix_new_handleOpenRequest(void *self, void *cmd, void *request, void *options,
+                                                   void *activationSettings, void *origin, void *withResult) {
+    axs_trollopenfix_orig_handleOpenRequest(self, cmd, request, options, activationSettings, origin, withResult);
     @try {
-        axs_trollopenfix_handleRouteEvent(request, options, activationSettings, origin, nil);
+        axs_trollopenfix_handleRouteEvent(
+            axs_trollopenfix_plausibleObject(request) ? (__bridge id)request : nil,
+            axs_trollopenfix_plausibleObject(options) ? (__bridge id)options : nil,
+            axs_trollopenfix_plausibleObject(activationSettings) ? (__bridge id)activationSettings : nil,
+            axs_trollopenfix_plausibleObject(origin) ? (__bridge id)origin : nil);
     } @catch (NSException *e) {
         // 只记静态日志，不触碰异常对象，避免二次崩溃。
         NSLog(@"[TrollOpenFix] handleOpenRequest route processing exception (suppressed)");
     }
 }
 
-static void axs_trollopenfix_new_openURLCore(id self, SEL _cmd, id url, id display, id animating,
-                                             id activationSettings, id origin, id withResult) {
-    axs_trollopenfix_orig_openURLCore(self, _cmd, url, display, animating, activationSettings, origin, withResult);
+static void axs_trollopenfix_new_openURLCore(void *self, void *cmd, void *a2, void *a3, void *a4,
+                                             void *a5, void *a6, void *a7) {
+    axs_trollopenfix_orig_openURLCore(self, cmd, a2, a3, a4, a5, a6, a7);
     @try {
-        axs_trollopenfix_handleRouteEvent(nil, nil, activationSettings, origin, url);
+        // a5/a6 在三次崩溃样本中始终是有效对象（activationSettings/origin 位）；
+        // a2~a4 的真实类型存疑，不作为对象使用。
+        axs_trollopenfix_handleRouteEvent(nil, nil,
+            axs_trollopenfix_plausibleObject(a5) ? (__bridge id)a5 : nil,
+            axs_trollopenfix_plausibleObject(a6) ? (__bridge id)a6 : nil);
     } @catch (NSException *e) {
         // 只记静态日志，不触碰异常对象，避免二次崩溃。
         NSLog(@"[TrollOpenFix] openURLCore route processing exception (suppressed)");
@@ -451,7 +456,7 @@ static void axs_trollopenfix_hookRouteMethods(void) {
         SEL sel = NSSelectorFromString(@"_handleOpenApplicationRequest:options:activationSettings:origin:withResult:");
         IMP imp = axs_trollopenfix_replaceOwnMethod(wsClass, sel, (IMP)axs_trollopenfix_new_handleOpenRequest);
         if (imp) {
-            axs_trollopenfix_orig_handleOpenRequest = (void (*)(id, SEL, id, id, id, id, id))imp;
+            axs_trollopenfix_orig_handleOpenRequest = (void (*)(void *, void *, void *, void *, void *, void *, void *))imp;
             AXS_TROLLOPEN_FIX_LOG(@"SBMainWorkspace _handleOpenApplicationRequest hooked");
         } else {
             AXS_TROLLOPEN_FIX_LOG(@"SBMainWorkspace route method unavailable");
@@ -462,7 +467,7 @@ static void axs_trollopenfix_hookRouteMethods(void) {
         SEL sel = NSSelectorFromString(@"_openURLCore:display:animating:activationSettings:origin:withResult:");
         IMP imp = axs_trollopenfix_replaceOwnMethod(sbClass, sel, (IMP)axs_trollopenfix_new_openURLCore);
         if (imp) {
-            axs_trollopenfix_orig_openURLCore = (void (*)(id, SEL, id, id, id, id, id, id))imp;
+            axs_trollopenfix_orig_openURLCore = (void (*)(void *, void *, void *, void *, void *, void *, void *, void *))imp;
             AXS_TROLLOPEN_FIX_LOG(@"SpringBoard _openURLCore hooked");
         } else {
             AXS_TROLLOPEN_FIX_LOG(@"SpringBoard route method unavailable");
