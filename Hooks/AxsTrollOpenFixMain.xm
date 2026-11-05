@@ -632,6 +632,7 @@ typedef NS_ENUM(NSInteger, AxsTrollOpenFixIconChoice) {
 
 static char axs_trollopenfix_pendingChoiceKey;
 static char axs_trollopenfix_pendingResetKey;
+static char axs_trollopenfix_pendingIdentifierKey;
 
 static NSString *axs_trollopenfix_toolsDir(void) {
     return @"/var/mobile/TrollOpenJB/ShortcutIcons/tools";
@@ -672,6 +673,8 @@ static void axs_trollopenfix_new_didSelect(id self, SEL _cmd, id tableView, id i
                                     objc_setAssociatedObject(self, &axs_trollopenfix_pendingChoiceKey,
                                         @(choice), OBJC_ASSOCIATION_RETAIN);
                                     objc_setAssociatedObject(self, &axs_trollopenfix_pendingResetKey, nil, OBJC_ASSOCIATION_RETAIN);
+                                    // 自己存 identifier，不依赖原始的 pendingIconItem（它在 didFinishPicking 时可能已被清空）
+                                    objc_setAssociatedObject(self, &axs_trollopenfix_pendingIdentifierKey, identifier, OBJC_ASSOCIATION_RETAIN);
                                     // 先收起状态选择弹窗，动画结束后再走原流程弹出相册，
                                     // 否则相册的呈现会和弹窗收起动画冲突（表现为要点好几次才进相册）。
                                     UIViewController *presented = [(UIViewController *)self presentedViewController];
@@ -738,13 +741,14 @@ static void axs_trollopenfix_new_didFinishPicking(id self, SEL _cmd, id picker, 
 
     if (choice != AxsTrollOpenFixIconChoiceNormal) {
         // 状态图标：直接落盘 on-/off- 文件，不进入普通图标保存流程。
+        // identifier 从弹窗选择时存的关联对象读取（不依赖原始 pendingIconItem）。
         @try {
-            NSDictionary *item = axs_trollopenfix_safeGet(self, @"pendingIconItem");
-            NSString *identifier = [item isKindOfClass:[NSDictionary class]] ? item[@"identifier"] : nil;
-            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state save: item=%@ identifier=%@ infoKeys=%@",
-                                   NSStringFromClass([item class]), identifier, [info allKeys]]));
+            NSString *identifier = objc_getAssociatedObject(self, &axs_trollopenfix_pendingIdentifierKey);
+            objc_setAssociatedObject(self, &axs_trollopenfix_pendingIdentifierKey, nil, OBJC_ASSOCIATION_RETAIN);
+            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state save: identifier=%@ infoKeys=%@",
+                                   identifier, [info allKeys]]));
             if (![identifier isKindOfClass:[NSString class]] || !identifier.length) {
-                AXS_TROLLOPEN_FIX_LOG(@"state save skipped: no identifier");
+                AXS_TROLLOPEN_FIX_LOG(@"state save skipped: no identifier from alert");
                 return;
             }
             UIImage *image = info[UIImagePickerControllerOriginalImage];
