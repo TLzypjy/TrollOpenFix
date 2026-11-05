@@ -126,11 +126,21 @@ static void axs_trollopenfix_collectFloatingWindows(UIView *view, NSMutableArray
     }
 }
 
+static NSArray *axs_trollopenfix_allWindows(void) {
+    NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            [windows addObjectsFromArray:((UIWindowScene *)scene).windows];
+        }
+    }
+    return windows;
+}
+
 static NSArray *axs_trollopenfix_floatingWindowsForBundleID(NSString *bundleID) {
     Class cls = axs_trollopenfix_floatingWindowClass();
     if (!cls || !bundleID) return @[];
     NSMutableArray *all = [NSMutableArray array];
-    for (UIWindow *window in [UIApplication sharedApplication].windows) {
+    for (UIWindow *window in axs_trollopenfix_allWindows()) {
         if (cls && [window isKindOfClass:cls]) {
             [all addObject:window];
             continue;
@@ -155,7 +165,7 @@ static BOOL axs_trollopenfix_closeFloatingWindow(id win) {
         SEL sel = NSSelectorFromString(name);
         if ([win respondsToSelector:sel]) {
             ((void(*)(id, SEL))objc_msgSend)(win, sel);
-            AXS_TROLLOPEN_FIX_LOG([NSString stringWithFormat:@"closed floating window via %@ for %@", name, axs_trollopenfix_bundleIDOf(win)]);
+            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"closed floating window via %@ for %@", name, axs_trollopenfix_bundleIDOf(win)]));
             return YES;
         }
     }
@@ -179,8 +189,8 @@ static void axs_trollopenfix_processRoutePair(NSString *source, NSString *target
         && [target isEqualToString:axs_trollopenfix_lastRouteSource]) {
         // 反向命中：浮窗里的应用跳回来源应用 → 关闭它的浮窗。
         NSArray *wins = axs_trollopenfix_floatingWindowsForBundleID(source);
-        AXS_TROLLOPEN_FIX_LOG([NSString stringWithFormat:@"reverse route matched source=%@ target=%@ windows=%lu",
-                              source, target, (unsigned long)wins.count]);
+        AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"reverse route matched source=%@ target=%@ windows=%lu",
+                              source, target, (unsigned long)wins.count]));
         for (id win in wins) {
             axs_trollopenfix_closeFloatingWindow(win);
         }
@@ -216,7 +226,7 @@ static void axs_trollopenfix_handleRouteEvent(id request, id options, id activat
     NSString *urlString = nil;
     @try {
         id u = [request valueForKey:@"URL"] ?: [request valueForKey:@"url"];
-        if ([u isKindOfClass:[NSURL class]]) urlString = u.absoluteString;
+        if ([u isKindOfClass:[NSURL class]]) urlString = [(NSURL *)u absoluteString];
         else if ([u isKindOfClass:[NSString class]]) urlString = u;
     } @catch (NSException *e) {}
     if (urlCandidate && !urlString) {
@@ -277,8 +287,8 @@ static void axs_trollopenfix_snapMiniWindow(id win) {
 
     if (fabs(targetX - view.center.x) < 1.0 && fabs(targetY - view.center.y) < 1.0) return;
 
-    AXS_TROLLOPEN_FIX_LOG([NSString stringWithFormat:@"snap mini window %@ to x=%.1f y=%.1f",
-                          axs_trollopenfix_bundleIDOf(win), targetX, targetY]);
+    AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"snap mini window %@ to x=%.1f y=%.1f",
+                          axs_trollopenfix_bundleIDOf(win), targetX, targetY]));
     [UIView animateWithDuration:0.3
                           delay:0
                         options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
@@ -399,8 +409,8 @@ static void axs_trollopenfix_hookFloatingWindowClass(void) {
 
 #pragma mark - SpringBoard 路由 hook
 
-static void (*axs_trollopenfix_orig_handleOpenRequest)(id, SEL, id, id, id, id, id);
-static void (*axs_trollopenfix_orig_openURLCore)(id, SEL, id, id, id, id, id);
+static void (*axs_trollopenfix_orig_handleOpenRequest)(id, SEL, id, id, id, id, id, id);
+static void (*axs_trollopenfix_orig_openURLCore)(id, SEL, id, id, id, id, id, id);
 
 static void axs_trollopenfix_new_handleOpenRequest(id self, SEL _cmd, id request, id options,
                                                    id activationSettings, id origin, id withResult) {
@@ -409,7 +419,7 @@ static void axs_trollopenfix_new_handleOpenRequest(id self, SEL _cmd, id request
     @try {
         axs_trollopenfix_handleRouteEvent(request, options, activationSettings, origin, nil, preFrontmost);
     } @catch (NSException *e) {
-        AXS_TROLLOPEN_FIX_LOG([NSString stringWithFormat:@"handleOpenRequest extract failed: %@", e]);
+        AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"handleOpenRequest extract failed: %@", e]));
     }
 }
 
@@ -420,7 +430,7 @@ static void axs_trollopenfix_new_openURLCore(id self, SEL _cmd, id url, id displ
     @try {
         axs_trollopenfix_handleRouteEvent(nil, nil, activationSettings, origin, url, preFrontmost);
     } @catch (NSException *e) {
-        AXS_TROLLOPEN_FIX_LOG([NSString stringWithFormat:@"openURLCore extract failed: %@", e]);
+        AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"openURLCore extract failed: %@", e]));
     }
 }
 
@@ -430,7 +440,7 @@ static void axs_trollopenfix_hookRouteMethods(void) {
         SEL sel = NSSelectorFromString(@"_handleOpenApplicationRequest:options:activationSettings:origin:withResult:");
         IMP imp = axs_trollopenfix_replaceOwnMethod(wsClass, sel, (IMP)axs_trollopenfix_new_handleOpenRequest);
         if (imp) {
-            axs_trollopenfix_orig_handleOpenRequest = (void (*)(id, SEL, id, id, id, id, id))imp;
+            axs_trollopenfix_orig_handleOpenRequest = (void (*)(id, SEL, id, id, id, id, id, id))imp;
             AXS_TROLLOPEN_FIX_LOG(@"SBMainWorkspace _handleOpenApplicationRequest hooked");
         } else {
             AXS_TROLLOPEN_FIX_LOG(@"SBMainWorkspace route method unavailable");
@@ -441,7 +451,7 @@ static void axs_trollopenfix_hookRouteMethods(void) {
         SEL sel = NSSelectorFromString(@"_openURLCore:display:animating:activationSettings:origin:withResult:");
         IMP imp = axs_trollopenfix_replaceOwnMethod(sbClass, sel, (IMP)axs_trollopenfix_new_openURLCore);
         if (imp) {
-            axs_trollopenfix_orig_openURLCore = (void (*)(id, SEL, id, id, id, id, id))imp;
+            axs_trollopenfix_orig_openURLCore = (void (*)(id, SEL, id, id, id, id, id, id))imp;
             AXS_TROLLOPEN_FIX_LOG(@"SpringBoard _openURLCore hooked");
         } else {
             AXS_TROLLOPEN_FIX_LOG(@"SpringBoard route method unavailable");
