@@ -625,7 +625,7 @@ static void axs_trollopenfix_new_didSelect(id self, SEL _cmd, id tableView, id i
                     id item = ((id(*)(id, SEL, id))objc_msgSend)(self, itemSel, indexPath);
                     if ([item isKindOfClass:[NSDictionary class]]) {
                         NSNumber *type = item[@"type"];
-                        BOOL changeable = [((BOOL(*)(id, SEL, id))objc_msgSend)(self, canSel, item)];
+                        BOOL changeable = ((BOOL(*)(id, SEL, id))objc_msgSend)(self, canSel, item);
                         if (changeable && type && type.unsignedIntValue < 4) {
                             NSString *identifier = item[@"identifier"];
                             NSString *title = item[@"title"];
