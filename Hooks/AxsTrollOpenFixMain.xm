@@ -36,7 +36,21 @@ static BOOL axs_trollopenfix_looksLikeBundleID(NSString *s) {
     return [s rangeOfCharacterFromSet:allowed.invertedSet].location == NSNotFound;
 }
 
-// 从任意 SpringBoard 对象中尽量提取 bundle id；全部走 KVC 并吞掉未定义键异常。
+// 无异常取值：只探测 getter 形式的方法，不使用 KVC（KVC 对未知键会抛
+// NSUndefinedKeyException，在 SpringBoard 热路径上风险过高）。
+static id axs_trollopenfix_safeGet(id obj, NSString *key) {
+    if (!obj || key.length == 0) return nil;
+    SEL sel = NSSelectorFromString(key);
+    if ([(id)object_getClass(obj) respondsToSelector:sel]) {
+        return ((id(*)(id, SEL))objc_msgSend)(obj, sel);
+    }
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        return [(NSDictionary *)obj objectForKey:key];
+    }
+    return nil;
+}
+
+// 从任意 SpringBoard 对象中尽量提取 bundle id；只做 getter 探测，结构上无异常。
 static NSString *axs_trollopenfix_extractBundleID(id obj) {
     if (!obj) return nil;
     if ([obj isKindOfClass:[NSString class]]) {
@@ -47,20 +61,15 @@ static NSString *axs_trollopenfix_extractBundleID(id obj) {
     NSArray *keys = @[@"targetBundleID", @"bundleIdentifier", @"displayIdentifier",
                       @"applicationIdentifier", @"appIdentifier", @"identifier"];
     for (NSString *k in keys) {
-        @try {
-            id v = [obj valueForKey:k];
-            if (axs_trollopenfix_looksLikeBundleID(v)) return v;
-        } @catch (NSException *e) {}
+        id v = axs_trollopenfix_safeGet(obj, k);
+        if (axs_trollopenfix_looksLikeBundleID(v)) return v;
     }
     // 常见嵌套：originator / application / scene 等，向下探一层。
     NSArray *deepKeys = @[@"originator", @"application", @"app", @"target",
                           @"sourceApplication", @"scene", @"request"];
     for (NSString *k in deepKeys) {
-        @try {
-            id v = [obj valueForKey:k];
-            NSString *r = axs_trollopenfix_extractBundleID(v);
-            if (r) return r;
-        } @catch (NSException *e) {}
+        NSString *r = axs_trollopenfix_extractBundleID(axs_trollopenfix_safeGet(obj, k));
+        if (r) return r;
     }
     return nil;
 }
@@ -98,15 +107,11 @@ static Class axs_trollopenfix_floatingWindowClass(void) {
     return cls;
 }
 
-// 浮窗 bundleID 安全读取；键缺失返回 nil 而不是抛异常。
+// 浮窗 bundleID 安全读取；无异常取值（getter 探测）。
 static NSString *axs_trollopenfix_bundleIDOf(id win) {
     if (!win) return nil;
-    @try {
-        id bid = [win valueForKey:@"bundleID"];
-        return [bid isKindOfClass:[NSString class]] ? bid : nil;
-    } @catch (NSException *e) {
-        return nil;
-    }
+    id bid = axs_trollopenfix_safeGet(win, @"bundleID");
+    return [bid isKindOfClass:[NSString class]] ? bid : nil;
 }
 
 static BOOL axs_trollopenfix_isFloatingWindowFor(id win, NSString *bundleID) {
@@ -214,9 +219,7 @@ static void axs_trollopenfix_handleRouteEvent(id request, id options, id activat
 
     NSString *source = axs_trollopenfix_extractBundleID(origin);
     if (!source && options) {
-        @try {
-            source = axs_trollopenfix_extractBundleID([options valueForKey:@"originator"]);
-        } @catch (NSException *e) {}
+        source = axs_trollopenfix_extractBundleID(axs_trollopenfix_safeGet(options, @"originator"));
     }
     if (!source) source = axs_trollopenfix_extractBundleID(options);
     NSString *target = axs_trollopenfix_extractBundleID(request);
@@ -224,11 +227,9 @@ static void axs_trollopenfix_handleRouteEvent(id request, id options, id activat
 
     // 兜底 1：来源缺失但事件带 URL（多为应用回调 openURL），用调用发生前的前台应用兜底。
     NSString *urlString = nil;
-    @try {
-        id u = [request valueForKey:@"URL"] ?: [request valueForKey:@"url"];
-        if ([u isKindOfClass:[NSURL class]]) urlString = [(NSURL *)u absoluteString];
-        else if ([u isKindOfClass:[NSString class]]) urlString = u;
-    } @catch (NSException *e) {}
+    id u = axs_trollopenfix_safeGet(request, @"URL") ?: axs_trollopenfix_safeGet(request, @"url");
+    if ([u isKindOfClass:[NSURL class]]) urlString = [(NSURL *)u absoluteString];
+    else if ([u isKindOfClass:[NSString class]]) urlString = u;
     if (urlCandidate && !urlString) {
         urlString = [urlCandidate isKindOfClass:[NSURL class]] ? [(NSURL *)urlCandidate absoluteString] : nil;
     }
@@ -240,8 +241,12 @@ static void axs_trollopenfix_handleRouteEvent(id request, id options, id activat
     // 兜底 2：目标缺失时用 0.8s 后的前台应用（跳转完成后目标必然在前台）。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        NSString *t = target ?: axs_trollopenfix_frontmostIdentifier();
-        axs_trollopenfix_processRoutePair(source, t);
+        @try {
+            NSString *t = target ?: axs_trollopenfix_frontmostIdentifier();
+            axs_trollopenfix_processRoutePair(source, t);
+        } @catch (NSException *e) {
+            NSLog(@"[TrollOpenFix] deferred route processing exception (suppressed)");
+        }
     });
 }
 
@@ -419,7 +424,8 @@ static void axs_trollopenfix_new_handleOpenRequest(id self, SEL _cmd, id request
     @try {
         axs_trollopenfix_handleRouteEvent(request, options, activationSettings, origin, nil, preFrontmost);
     } @catch (NSException *e) {
-        AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"handleOpenRequest extract failed: %@", e]));
+        // 只记静态日志，不触碰异常对象，避免二次崩溃。
+        NSLog(@"[TrollOpenFix] handleOpenRequest route processing exception (suppressed)");
     }
 }
 
@@ -430,7 +436,8 @@ static void axs_trollopenfix_new_openURLCore(id self, SEL _cmd, id url, id displ
     @try {
         axs_trollopenfix_handleRouteEvent(nil, nil, activationSettings, origin, url, preFrontmost);
     } @catch (NSException *e) {
-        AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"openURLCore extract failed: %@", e]));
+        // 只记静态日志，不触碰异常对象，避免二次崩溃。
+        NSLog(@"[TrollOpenFix] openURLCore route processing exception (suppressed)");
     }
 }
 
