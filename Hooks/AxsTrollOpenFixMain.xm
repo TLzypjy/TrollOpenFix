@@ -591,57 +591,143 @@ static void axs_trollopenfix_hookMenuIconReload(void) {
 
 #pragma mark - 系统工具双态图标（偏好面板侧，Settings）
 
+// 流程与图二一致：点击可换图标的条目 → 先选状态（修改图标/开启/关闭/恢复）→ 再进相册。
+// 状态图标保存为 tools/on-<identifier>.png / off-<identifier>.png，与普通图标互不影响。
+
+typedef NS_ENUM(NSInteger, AxsTrollOpenFixIconChoice) {
+    AxsTrollOpenFixIconChoiceNormal = 0,
+    AxsTrollOpenFixIconChoiceOn     = 1,
+    AxsTrollOpenFixIconChoiceOff    = 2,
+};
+
+static char axs_trollopenfix_pendingChoiceKey;
+static char axs_trollopenfix_pendingResetKey;
+
+static NSString *axs_trollopenfix_toolsDir(void) {
+    return @"/var/mobile/TrollOpenJB/ShortcutIcons/tools";
+}
+
+static NSString *axs_trollopenfix_stateIconPathForChoice(NSString *identifier, AxsTrollOpenFixIconChoice choice) {
+    NSString *state = (choice == AxsTrollOpenFixIconChoiceOn) ? @"on" : @"off";
+    return [NSString stringWithFormat:@"%@/%@-%@.png", axs_trollopenfix_toolsDir(),
+            state, axs_trollopenfix_sanitized(identifier)];
+}
+
+static void (*axs_trollopenfix_orig_didSelect)(id, SEL, id, id);
+static void axs_trollopenfix_new_didSelect(id self, SEL _cmd, id tableView, id indexPath) {
+    @try {
+        if (axs_trollopenfix_enabled()) {
+            Class listCls = objc_getClass("TOJFanMenuListController");
+            if (listCls && [self isKindOfClass:listCls]) {
+                SEL itemSel = @selector(itemForIndexPath:);
+                SEL canSel = @selector(canChangeIconForItem:);
+                if ([self respondsToSelector:itemSel] && [self respondsToSelector:canSel]) {
+                    id item = ((id(*)(id, SEL, id))objc_msgSend)(self, itemSel, indexPath);
+                    if ([item isKindOfClass:[NSDictionary class]]) {
+                        NSNumber *type = item[@"type"];
+                        BOOL changeable = [((BOOL(*)(id, SEL, id))objc_msgSend)(self, canSel, item)];
+                        if (changeable && type && type.unsignedIntValue < 4) {
+                            NSString *identifier = item[@"identifier"];
+                            NSString *title = item[@"title"];
+                            if ([identifier isKindOfClass:[NSString class]] && identifier.length) {
+                                NSFileManager *fm = [NSFileManager defaultManager];
+                                NSString *tools = axs_trollopenfix_toolsDir();
+                                UIAlertController *alert = [UIAlertController
+                                    alertControllerWithTitle:title ?: @"TrollOpen"
+                                    message:@"选择要设置的图标状态"
+                                    preferredStyle:UIAlertControllerStyleAlert];
+                                void (^openPicker)(AxsTrollOpenFixIconChoice) = ^(AxsTrollOpenFixIconChoice choice) {
+                                    objc_setAssociatedObject(self, &axs_trollopenfix_pendingChoiceKey,
+                                        @(choice), OBJC_ASSOCIATION_RETAIN);
+                                    objc_setAssociatedObject(self, &axs_trollopenfix_pendingResetKey, nil, OBJC_ASSOCIATION_RETAIN);
+                                    axs_trollopenfix_orig_didSelect(self, @selector(tableView:didSelectRowAtIndexPath:), tableView, indexPath);
+                                };
+                                [alert addAction:[UIAlertAction actionWithTitle:@"修改图标（普通）" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+                                    openPicker(AxsTrollOpenFixIconChoiceNormal);
+                                }]];
+                                [alert addAction:[UIAlertAction actionWithTitle:@"设置开启状态图标" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+                                    openPicker(AxsTrollOpenFixIconChoiceOn);
+                                }]];
+                                [alert addAction:[UIAlertAction actionWithTitle:@"设置关闭状态图标" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+                                    openPicker(AxsTrollOpenFixIconChoiceOff);
+                                }]];
+                                [alert addAction:[UIAlertAction actionWithTitle:@"恢复系统图标" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
+                                    objc_setAssociatedObject(self, &axs_trollopenfix_pendingChoiceKey, nil, OBJC_ASSOCIATION_RETAIN);
+                                    objc_setAssociatedObject(self, &axs_trollopenfix_pendingResetKey, @YES, OBJC_ASSOCIATION_RETAIN);
+                                    NSString *sid = axs_trollopenfix_sanitized(identifier);
+                                    NSString *sname = axs_trollopenfix_sanitized([title isKindOfClass:[NSString class]] ? title : @"");
+                                    [fm removeItemAtPath:[NSString stringWithFormat:@"%@/on-%@.png", tools, sid] error:nil];
+                                    [fm removeItemAtPath:[NSString stringWithFormat:@"%@/off-%@.png", tools, sid] error:nil];
+                                    [fm removeItemAtPath:[NSString stringWithFormat:@"%@/%@-%@.png", tools, sname, sid] error:nil];
+                                    [fm removeItemAtPath:[NSString stringWithFormat:@"/var/mobile/TrollOpenJB/ShortcutIcons/%@-%@.png", sname, sid] error:nil];
+                                    SEL reloadSel = @selector(reloadModel);
+                                    if ([self respondsToSelector:reloadSel]) {
+                                        ((void(*)(id, SEL))objc_msgSend)(self, reloadSel);
+                                    }
+                                }]];
+                                [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+                                [self presentViewController:alert animated:YES completion:nil];
+                                return; // 已接管本次点击
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[TrollOpenFix] prefs state select exception (suppressed)");
+    }
+    axs_trollopenfix_orig_didSelect(self, _cmd, tableView, indexPath);
+}
+
 static void (*axs_trollopenfix_orig_didFinishPicking)(id, SEL, id, id);
 static void axs_trollopenfix_new_didFinishPicking(id self, SEL _cmd, id picker, id info) {
-    axs_trollopenfix_orig_didFinishPicking(self, _cmd, picker, info);
-    @try {
-        if (!axs_trollopenfix_enabled()) return;
-        Class listCls = objc_getClass("TOJFanMenuListController");
-        if (!listCls || ![self isKindOfClass:listCls]) return;
-        NSDictionary *item = axs_trollopenfix_safeGet(self, @"pendingIconItem");
-        if (![item isKindOfClass:[NSDictionary class]]) return;
-        NSNumber *stateful = item[@"stateful"];
-        if (!stateful.boolValue) return;
-        NSString *identifier = item[@"identifier"];
-        if (![identifier isKindOfClass:[NSString class]] || identifier.length == 0) return;
-        // 保存流程先落盘普通图标；这里确认用户是否要把它用作状态图标。
-        // 状态图标与普通图标相互独立（on-/off- 前缀），因此复制时机不依赖刚保存的文件内容。
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"TrollOpen 双态图标"
-                                    message:@"是否将图标用于工具的开启/关闭状态？（on-/off- 前缀文件，可在 Filza 中替换为不同图片）"
-                                    preferredStyle:UIAlertControllerStyleAlert];
-        NSString *toolsDir = @"/var/mobile/TrollOpenJB/ShortcutIcons/tools";
-        void (^copyDefault)(NSString *) = ^(NSString *state) {
-            // 默认以当前普通图标为底本；不存在则不复制（用户可稍后自行放置对应文件）。
-            NSString *src = [NSString stringWithFormat:@"%@/%@-%@.png", toolsDir,
-                             axs_trollopenfix_sanitized([item valueForKey:@"title"] ?: @""),
-                             axs_trollopenfix_sanitized(identifier)];
-            NSString *dst = [NSString stringWithFormat:@"%@/%@-%@.png", toolsDir, state, axs_trollopenfix_sanitized(identifier)];
-            NSFileManager *fm = [NSFileManager defaultManager];
-            if ([fm fileExistsAtPath:src]) {
-                [fm removeItemAtPath:dst error:nil];
-                [fm copyItemAtPath:src toPath:dst error:nil];
-            } else {
-                [fm createFileAtPath:dst contents:nil attributes:nil];
+    NSInteger choice = AxsTrollOpenFixIconChoiceNormal;
+    NSNumber *stored = objc_getAssociatedObject(self, &axs_trollopenfix_pendingChoiceKey);
+    if (stored) choice = stored.integerValue;
+    objc_setAssociatedObject(self, &axs_trollopenfix_pendingChoiceKey, nil, OBJC_ASSOCIATION_RETAIN);
+
+    if (choice != AxsTrollOpenFixIconChoiceNormal) {
+        // 状态图标：直接落盘 on-/off- 文件，不进入普通图标保存流程。
+        @try {
+            NSDictionary *item = axs_trollopenfix_safeGet(self, @"pendingIconItem");
+            NSString *identifier = [item isKindOfClass:[NSDictionary class]] ? item[@"identifier"] : nil;
+            if (![identifier isKindOfClass:[NSString class]] || !identifier.length) return;
+            UIImage *image = info[UIImagePickerControllerOriginalImage];
+            if (!image) return;
+            NSData *png = UIImagePNGRepresentation(image);
+            if (!png) return;
+            NSString *path = axs_trollopenfix_stateIconPathForChoice(identifier, choice);
+            [png writeToFile:path atomically:YES];
+            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state icon saved: %@", path]));
+            SEL reloadSel = @selector(reloadModel);
+            if ([self respondsToSelector:reloadSel]) {
+                ((void(*)(id, SEL))objc_msgSend)(self, reloadSel);
             }
-        };
-        [alert addAction:[UIAlertAction actionWithTitle:@"设为开启状态图标" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { copyDefault(@"on"); }]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"设为关闭状态图标" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { copyDefault(@"off"); }]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"两种状态都用" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { copyDefault(@"on"); copyDefault(@"off"); }]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-        UIViewController *top = [self presentedViewController] ?: self;
-        [top presentViewController:alert animated:YES completion:nil];
-    } @catch (NSException *e) {
-        NSLog(@"[TrollOpenFix] prefs state icon exception (suppressed)");
+        } @catch (NSException *e) {
+            NSLog(@"[TrollOpenFix] prefs state save exception (suppressed)");
+        }
+        SEL dismissSel = @selector(dismissViewControllerAnimated:completion:);
+        if ([picker respondsToSelector:dismissSel]) {
+            ((void(*)(id, SEL, BOOL, id))objc_msgSend)(picker, dismissSel, YES, nil);
+        }
+        return;
     }
+    axs_trollopenfix_orig_didFinishPicking(self, _cmd, picker, info);
 }
 
 static void axs_trollopenfix_hookPrefsIconFlow(void) {
     Class listCls = objc_getClass("TOJFanMenuListController");
     if (!listCls) return;
-    SEL sel = @selector(imagePickerController:didFinishPickingMediaWithInfo:);
-    IMP imp = axs_trollopenfix_replaceOwnMethod(listCls, sel, (IMP)axs_trollopenfix_new_didFinishPicking);
-    if (imp) {
-        axs_trollopenfix_orig_didFinishPicking = (void (*)(id, SEL, id, id))imp;
+    SEL sel1 = @selector(tableView:didSelectRowAtIndexPath:);
+    IMP imp1 = axs_trollopenfix_replaceOwnMethod(listCls, sel1, (IMP)axs_trollopenfix_new_didSelect);
+    if (imp1) {
+        axs_trollopenfix_orig_didSelect = (void (*)(id, SEL, id, id))imp1;
+    }
+    SEL sel2 = @selector(imagePickerController:didFinishPickingMediaWithInfo:);
+    IMP imp2 = axs_trollopenfix_replaceOwnMethod(listCls, sel2, (IMP)axs_trollopenfix_new_didFinishPicking);
+    if (imp2) {
+        axs_trollopenfix_orig_didFinishPicking = (void (*)(id, SEL, id, id))imp2;
         AXS_TROLLOPEN_FIX_LOG(@"prefs icon flow hooked");
     }
 }
