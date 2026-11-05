@@ -570,52 +570,48 @@ static BOOL axs_trollopenfix_toolIsOn(NSString *identifier) {
     return NO; // 未知工具类型默认关闭状态
 }
 
-// 在菜单图标加载前，把正确的状态图复制到 -<id>.png（原始探测第二个路径，不需要名称）。
+// 在菜单图标加载前，检查每个有 on-/off- 底稿的工具，将正确状态的图覆盖到普通图标路径。
+// 普通图标路径 = tools/<标题>-<标识>.png（原始代码探测的第一个路径）。
 static void axs_trollopenfix_prepareStateIconFiles(void) {
-    NSString *toolsDir = @"/var/mobile/TrollOpenJB/ShortcutIcons/tools";
+    NSString *toolsDir = axs_trollopenfix_toolsDir();
     NSFileManager *fm = [NSFileManager defaultManager];
     NSArray *files = [fm contentsOfDirectoryAtPath:toolsDir error:nil];
     if (!files.count) return;
 
-    NSMutableSet *identifiers = [NSMutableSet set];
+    // 收集有 on-/off- 底稿的 identifier
+    NSMutableSet *stateIds = [NSMutableSet set];
     for (NSString *f in files) {
         if ([f hasPrefix:@"on-"] && [f hasSuffix:@".png"]) {
-            [identifiers addObject:[f substringFromIndex:3]];
+            [stateIds addObject:[f substringFromIndex:3]];
         } else if ([f hasPrefix:@"off-"] && [f hasSuffix:@".png"]) {
-            NSString *id_part = [f substringFromIndex:4];
-            id_part = [id_part substringToIndex:id_part.length - 4]; // 去 .png
-            [identifiers addObject:[id_part stringByAppendingString:@".png"] ? id_part : id_part];
+            NSString *idPart = [f substringFromIndex:4];
+            [stateIds addObject:[idPart substringToIndex:idPart.length - 4]];
         }
     }
-    if (!identifiers.count) return;
+    if (!stateIds.count) return;
 
-    for (NSString *sid in identifiers) {
-        NSString *idNoExt = sid;
-        if ([sid hasSuffix:@".png"]) idNoExt = [sid substringToIndex:sid.length - 4];
-        BOOL on = axs_trollopenfix_toolIsOn(idNoExt);
-        NSString *src = [NSString stringWithFormat:@"%@/%@-%@.png", toolsDir, on ? @"on" : @"off", idNoExt];
-        NSString *dst = [NSString stringWithFormat:@"%@/-%@.png", toolsDir, idNoExt];
-        // 如果状态图没变且目标文件已存在则跳过（减少磁盘写入）
-        static NSMutableDictionary *lastState;
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{ lastState = [NSMutableDictionary dictionary]; });
-        NSString *key = idNoExt;
-        NSString *lastSrc = lastState[key];
-        if (lastSrc && [lastSrc isEqualToString:src] && [fm fileExistsAtPath:dst]) continue;
-        // 复制
-        [fm removeItemAtPath:dst error:nil];
-        NSError *err = nil;
-        if ([fm copyItemAtPath:src toPath:dst error:&err]) {
-            lastState[key] = src;
-            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state file prepared: %@ → %@ (on=%d)", src, dst, on]));
-        } else {
-            // src 可能是 on-<id>.png 而非 on-<id>.png，试直读
+    static NSMutableDictionary *lastSwap; // identifier → 上次使用的状态图路径
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lastSwap = [NSMutableDictionary dictionary]; });
+
+    for (NSString *sid in stateIds) {
+        BOOL on = axs_trollopenfix_toolIsOn(sid);
+        NSString *src = [NSString stringWithFormat:@"%@/%@-%@.png", toolsDir, on ? @"on" : @"off", sid];
+        NSString *lastSrc = lastSwap[sid];
+        if (lastSrc && [lastSrc isEqualToString:src]) continue; // 状态没变
+        // 找到普通图标文件（任意名-<id>.png）并覆盖
+        NSString *suffix = [NSString stringWithFormat:@"-%@.png", sid];
+        for (NSString *f in files) {
+            if ([f hasPrefix:@"on-"] || [f hasPrefix:@"off-"] || [f hasPrefix:@"-"]) continue;
+            if (![f hasSuffix:suffix]) continue;
+            NSString *normalPath = [toolsDir stringByAppendingPathComponent:f];
             NSData *data = [NSData dataWithContentsOfFile:src];
             if (data) {
-                [data writeToFile:dst options:NSDataWritingAtomic error:nil];
-                lastState[key] = src;
-                AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state file written: %@ (on=%d)", dst, on]));
+                [data writeToFile:normalPath options:NSDataWritingAtomic error:nil];
+                lastSwap[sid] = src;
+                AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state icon swapped: %@ → %@ (on=%d)", src, normalPath, on]));
             }
+            break;
         }
     }
 }
@@ -676,6 +672,7 @@ typedef NS_ENUM(NSInteger, AxsTrollOpenFixIconChoice) {
 static char axs_trollopenfix_pendingChoiceKey;
 static char axs_trollopenfix_pendingResetKey;
 static char axs_trollopenfix_pendingIdentifierKey;
+static char axs_trollopenfix_pendingTitleKey;
 
 static NSString *axs_trollopenfix_toolsDir(void) {
     return @"/var/mobile/TrollOpenJB/ShortcutIcons/tools";
@@ -716,8 +713,10 @@ static void axs_trollopenfix_new_didSelect(id self, SEL _cmd, id tableView, id i
                                     objc_setAssociatedObject(self, &axs_trollopenfix_pendingChoiceKey,
                                         @(choice), OBJC_ASSOCIATION_RETAIN);
                                     objc_setAssociatedObject(self, &axs_trollopenfix_pendingResetKey, nil, OBJC_ASSOCIATION_RETAIN);
-                                    // 自己存 identifier，不依赖原始的 pendingIconItem（它在 didFinishPicking 时可能已被清空）
+                                    // 自己存 identifier 和 title，不依赖原始的 pendingIconItem
                                     objc_setAssociatedObject(self, &axs_trollopenfix_pendingIdentifierKey, identifier, OBJC_ASSOCIATION_RETAIN);
+                                    objc_setAssociatedObject(self, &axs_trollopenfix_pendingTitleKey,
+                                        [title isKindOfClass:[NSString class]] ? title : @"", OBJC_ASSOCIATION_RETAIN);
                                     // 先收起状态选择弹窗，动画结束后再走原流程弹出相册，
                                     // 否则相册的呈现会和弹窗收起动画冲突（表现为要点好几次才进相册）。
                                     UIViewController *presented = [(UIViewController *)self presentedViewController];
@@ -746,8 +745,7 @@ static void axs_trollopenfix_new_didSelect(id self, SEL _cmd, id tableView, id i
                                     for (NSString *dir in (@[tools, @"/var/mobile/TrollOpenJB/ShortcutIcons"])) {
                                         NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
                                         for (NSString *f in files) {
-                                            BOOL hit = [f hasSuffix:suffixDash];
-                                            if (!hit) continue;
+                                            if (![f hasSuffix:suffixDash]) continue;
                                             NSString *full = [dir stringByAppendingPathComponent:f];
                                             if ([fm removeItemAtPath:full error:nil]) {
                                                 AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"reset removed: %@", full]));
@@ -783,13 +781,14 @@ static void axs_trollopenfix_new_didFinishPicking(id self, SEL _cmd, id picker, 
     AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"didFinishPicking choice=%ld", (long)choice]));
 
     if (choice != AxsTrollOpenFixIconChoiceNormal) {
-        // 状态图标：直接落盘 on-/off- 文件，不进入普通图标保存流程。
-        // identifier 从弹窗选择时存的关联对象读取（不依赖原始 pendingIconItem）。
+        // 状态图标：直接落盘 on-/off- 文件 + 立即写入普通图标路径使其生效。
         @try {
             NSString *identifier = objc_getAssociatedObject(self, &axs_trollopenfix_pendingIdentifierKey);
+            NSString *title = objc_getAssociatedObject(self, &axs_trollopenfix_pendingTitleKey);
             objc_setAssociatedObject(self, &axs_trollopenfix_pendingIdentifierKey, nil, OBJC_ASSOCIATION_RETAIN);
-            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state save: identifier=%@ infoKeys=%@",
-                                   identifier, [info allKeys]]));
+            objc_setAssociatedObject(self, &axs_trollopenfix_pendingTitleKey, nil, OBJC_ASSOCIATION_RETAIN);
+            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state save: identifier=%@ title=%@",
+                                   identifier, title]));
             if (![identifier isKindOfClass:[NSString class]] || !identifier.length) {
                 AXS_TROLLOPEN_FIX_LOG(@"state save skipped: no identifier from alert");
                 return;
@@ -804,16 +803,22 @@ static void axs_trollopenfix_new_didFinishPicking(id self, SEL _cmd, id picker, 
                 AXS_TROLLOPEN_FIX_LOG(@"state save skipped: PNG encode failed");
                 return;
             }
-            NSString *path = axs_trollopenfix_stateIconPathForChoice(identifier, choice);
-            NSError *writeError = nil;
-            if ([png writeToFile:path options:NSDataWritingAtomic error:&writeError] && !writeError) {
-                AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state icon saved: %@", path]));
-                SEL reloadSel = @selector(reloadModel);
-                if ([self respondsToSelector:reloadSel]) {
-                    ((void(*)(id, SEL))objc_msgSend)(self, reloadSel);
-                }
-            } else {
-                AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state save failed: %@ (write error)", path]));
+            NSString *toolsDir = axs_trollopenfix_toolsDir();
+            NSString *sid = axs_trollopenfix_sanitized(identifier);
+            NSString *sname = axs_trollopenfix_sanitized([title isKindOfClass:[NSString class]] ? title : @"");
+            NSString *statePrefix = (choice == AxsTrollOpenFixIconChoiceOn) ? @"on" : @"off";
+            // 1) 保存状态底稿
+            NSString *statePath = [NSString stringWithFormat:@"%@/%@-%@.png", toolsDir, statePrefix, sid];
+            [png writeToFile:statePath options:NSDataWritingAtomic error:nil];
+            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state icon saved: %@", statePath]));
+            // 2) 立即写入普通图标路径使菜单生效
+            NSString *normalPath = [NSString stringWithFormat:@"%@/%@-%@.png", toolsDir, sname, sid];
+            [png writeToFile:normalPath options:NSDataWritingAtomic error:nil];
+            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"normal icon overwritten: %@", normalPath]));
+            // 3) 刷新
+            SEL reloadSel = @selector(reloadModel);
+            if ([self respondsToSelector:reloadSel]) {
+                ((void(*)(id, SEL))objc_msgSend)(self, reloadSel);
             }
         } @catch (NSException *e) {
             NSLog(@"[TrollOpenFix] prefs state save exception (suppressed)");
