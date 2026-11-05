@@ -678,7 +678,6 @@ static NSString *axs_trollopenfix_toolsDir(void) {
     return @"/var/mobile/TrollOpenJB/ShortcutIcons/tools";
 }
 
-#pragma unused(axs_trollopenfix_stateIconPathForChoice)
 __attribute__((unused)) static NSString *axs_trollopenfix_stateIconPathForChoice(NSString *identifier, NSInteger choice) {
     NSString *state = (choice == AxsTrollOpenFixIconChoiceOn) ? @"on" : @"off";
     return [NSString stringWithFormat:@"%@/%@-%@.png", @"/var/mobile/TrollOpenJB/ShortcutIcons/tools",
