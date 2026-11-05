@@ -564,6 +564,7 @@ static void axs_trollopenfix_applyMenuStateIcons(id manager) {
             if (current == img) continue;
             [item setValue:img forKey:@"iconImage"];
             dirty = YES;
+            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state icon applied: %@ (on=%d)", path, enabled.boolValue]));
         } @catch (NSException *e) {
             // 单个条目失败不影响其余条目。
         }
@@ -671,7 +672,16 @@ static void axs_trollopenfix_new_didSelect(id self, SEL _cmd, id tableView, id i
                                     objc_setAssociatedObject(self, &axs_trollopenfix_pendingChoiceKey,
                                         @(choice), OBJC_ASSOCIATION_RETAIN);
                                     objc_setAssociatedObject(self, &axs_trollopenfix_pendingResetKey, nil, OBJC_ASSOCIATION_RETAIN);
-                                    axs_trollopenfix_orig_didSelect(self, @selector(tableView:didSelectRowAtIndexPath:), tableView, indexPath);
+                                    // 先收起状态选择弹窗，动画结束后再走原流程弹出相册，
+                                    // 否则相册的呈现会和弹窗收起动画冲突（表现为要点好几次才进相册）。
+                                    UIViewController *presented = [(UIViewController *)self presentedViewController];
+                                    if (presented) {
+                                        [presented dismissViewControllerAnimated:YES completion:^{
+                                            axs_trollopenfix_orig_didSelect(self, @selector(tableView:didSelectRowAtIndexPath:), tableView, indexPath);
+                                        }];
+                                    } else {
+                                        axs_trollopenfix_orig_didSelect(self, @selector(tableView:didSelectRowAtIndexPath:), tableView, indexPath);
+                                    }
                                 };
                                 [alert addAction:[UIAlertAction actionWithTitle:@"修改图标（普通）" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
                                     openPicker(AxsTrollOpenFixIconChoiceNormal);
@@ -686,11 +696,21 @@ static void axs_trollopenfix_new_didSelect(id self, SEL _cmd, id tableView, id i
                                     objc_setAssociatedObject(self, &axs_trollopenfix_pendingChoiceKey, nil, OBJC_ASSOCIATION_RETAIN);
                                     objc_setAssociatedObject(self, &axs_trollopenfix_pendingResetKey, @YES, OBJC_ASSOCIATION_RETAIN);
                                     NSString *sid = axs_trollopenfix_sanitized(identifier);
-                                    NSString *sname = axs_trollopenfix_sanitized([title isKindOfClass:[NSString class]] ? title : @"");
-                                    [fm removeItemAtPath:[NSString stringWithFormat:@"%@/on-%@.png", tools, sid] error:nil];
-                                    [fm removeItemAtPath:[NSString stringWithFormat:@"%@/off-%@.png", tools, sid] error:nil];
-                                    [fm removeItemAtPath:[NSString stringWithFormat:@"%@/%@-%@.png", tools, sname, sid] error:nil];
-                                    [fm removeItemAtPath:[NSString stringWithFormat:@"/var/mobile/TrollOpenJB/ShortcutIcons/%@-%@.png", sname, sid] error:nil];
+                                    NSString *suffixDash = [NSString stringWithFormat:@"-%@.png", sid];
+                                    NSString *suffixState = [NSString stringWithFormat:@"-%@.png", sid];
+                                    NSFileManager *fm = [NSFileManager defaultManager];
+                                    for (NSString *dir in (@[tools, @"/var/mobile/TrollOpenJB/ShortcutIcons"])) {
+                                        NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
+                                        for (NSString *f in files) {
+                                            BOOL isState = [f hasPrefix:@"on-"] || [f hasPrefix:@"off-"];
+                                            BOOL hit = [f hasSuffix:suffixDash] || (isState && [f hasSuffix:suffixState]);
+                                            if (!hit) continue;
+                                            NSString *full = [dir stringByAppendingPathComponent:f];
+                                            if ([fm removeItemAtPath:full error:nil]) {
+                                                AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"reset removed: %@", full]));
+                                            }
+                                        }
+                                    }
                                     SEL reloadSel = @selector(reloadModel);
                                     if ([self respondsToSelector:reloadSel]) {
                                         ((void(*)(id, SEL))objc_msgSend)(self, reloadSel);
@@ -724,17 +744,32 @@ static void axs_trollopenfix_new_didFinishPicking(id self, SEL _cmd, id picker, 
         @try {
             NSDictionary *item = axs_trollopenfix_safeGet(self, @"pendingIconItem");
             NSString *identifier = [item isKindOfClass:[NSDictionary class]] ? item[@"identifier"] : nil;
-            if (![identifier isKindOfClass:[NSString class]] || !identifier.length) return;
+            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state save: item=%@ identifier=%@ infoKeys=%@",
+                                   NSStringFromClass([item class]), identifier, [info allKeys]]));
+            if (![identifier isKindOfClass:[NSString class]] || !identifier.length) {
+                AXS_TROLLOPEN_FIX_LOG(@"state save skipped: no identifier");
+                return;
+            }
             UIImage *image = info[UIImagePickerControllerOriginalImage];
-            if (!image) return;
+            if (!image) {
+                AXS_TROLLOPEN_FIX_LOG(@"state save skipped: no original image in info");
+                return;
+            }
             NSData *png = UIImagePNGRepresentation(image);
-            if (!png) return;
+            if (!png) {
+                AXS_TROLLOPEN_FIX_LOG(@"state save skipped: PNG encode failed");
+                return;
+            }
             NSString *path = axs_trollopenfix_stateIconPathForChoice(identifier, choice);
-            [png writeToFile:path atomically:YES];
-            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state icon saved: %@", path]));
-            SEL reloadSel = @selector(reloadModel);
-            if ([self respondsToSelector:reloadSel]) {
-                ((void(*)(id, SEL))objc_msgSend)(self, reloadSel);
+            NSError *writeError = nil;
+            if ([png writeToFile:path options:NSDataWritingAtomic error:&writeError] && !writeError) {
+                AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state icon saved: %@", path]));
+                SEL reloadSel = @selector(reloadModel);
+                if ([self respondsToSelector:reloadSel]) {
+                    ((void(*)(id, SEL))objc_msgSend)(self, reloadSel);
+                }
+            } else {
+                AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state save failed: %@ (write error)", path]));
             }
         } @catch (NSException *e) {
             NSLog(@"[TrollOpenFix] prefs state save exception (suppressed)");
