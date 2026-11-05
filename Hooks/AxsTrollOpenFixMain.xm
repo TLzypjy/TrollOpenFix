@@ -539,7 +539,7 @@ static BOOL axs_trollopenfix_toolIsOn(NSString *identifier) {
         }
         return NO;
     }
-    // VPN：NEVPNStatus ~= 2 (connected) 或 3 (connecting)
+    // VPN：NEVPNManager
     if ([identifier isEqualToString:@"ToggleVPN"] || [identifier hasPrefix:@"VPN"]) {
         Class cls = objc_getClass("NEVPNManager");
         if (cls) {
@@ -567,52 +567,75 @@ static BOOL axs_trollopenfix_toolIsOn(NSString *identifier) {
     if ([identifier hasPrefix:@"DarkMode"] || [identifier hasPrefix:@"darkMode"]) {
         return [UIScreen mainScreen].traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
     }
-    return NO; // 未知工具类型默认关闭状态
+    return NO;
 }
 
-// 在菜单图标加载前，检查每个有 on-/off- 底稿的工具，将正确状态的图覆盖到普通图标路径。
-// 普通图标路径 = tools/<标题>-<标识>.png（原始代码探测的第一个路径）。
-static void axs_trollopenfix_prepareStateIconFiles(void) {
-    NSString *toolsDir = @"/var/mobile/TrollOpenJB/ShortcutIcons/tools";
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *files = [fm contentsOfDirectoryAtPath:toolsDir error:nil];
-    if (!files.count) return;
+// 在菜单图标加载完成后，遍历条目并按 stateEnabled 替换 iconImage。
+// 通过 ivar 名称直接访问（TOJBClass031 的 ivar 名未被加密）。
+static void axs_trollopenfix_applyMenuStateIcons(id manager) {
+    if (!manager) return;
+    Class itemCls = objc_getClass("TOJBClass031");
+    if (!itemCls) return;
 
-    // 收集有 on-/off- 底稿的 identifier
-    NSMutableSet *stateIds = [NSMutableSet set];
-    for (NSString *f in files) {
-        if ([f hasPrefix:@"on-"] && [f hasSuffix:@".png"]) {
-            [stateIds addObject:[f substringFromIndex:3]];
-        } else if ([f hasPrefix:@"off-"] && [f hasSuffix:@".png"]) {
-            NSString *idPart = [f substringFromIndex:4];
-            [stateIds addObject:[idPart substringToIndex:idPart.length - 4]];
+    // 按名称查找 ivar
+    static Ivar iv_items, iv_stateful, iv_runtime, iv_enabled, iv_identifier, iv_iconImage;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class mgrCls = objc_getClass("TOJBClass004");
+        Class mgrCls2 = objc_getClass("TOJBClass009");
+        // 两个管理类都可能，尝试按 _items 名称查找
+        iv_items = class_getInstanceVariable(mgrCls, "_items");
+        if (!iv_items && mgrCls2) iv_items = class_getInstanceVariable(mgrCls2, "_items");
+        iv_stateful = class_getInstanceVariable(itemCls, "_stateful");
+        iv_runtime = class_getInstanceVariable(itemCls, "_hasRuntimeState");
+        iv_enabled = class_getInstanceVariable(itemCls, "_stateEnabled");
+        iv_identifier = class_getInstanceVariable(itemCls, "_identifier");
+        iv_iconImage = class_getInstanceVariable(itemCls, "_iconImage");
+        AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"ivar lookup: items=%p stateful=%p runtime=%p enabled=%p id=%p icon=%p",
+                               iv_items, iv_stateful, iv_runtime, iv_enabled, iv_identifier, iv_iconImage]));
+    });
+    if (!iv_items || !iv_identifier || !iv_iconImage) return;
+
+    id items = object_getIvar(manager, iv_items);
+    if (![items isKindOfClass:[NSArray class]]) return;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL dirty = NO;
+    for (id item in items) {
+        if (![item isKindOfClass:itemCls]) continue;
+        @try {
+            BOOL stateful = object_getIvar(item, iv_stateful) ? [(id)object_getIvar(item, iv_stateful) boolValue] : NO;
+            BOOL runtime = object_getIvar(item, iv_runtime) ? [(id)object_getIvar(item, iv_runtime) boolValue] : NO;
+            if (!stateful || !runtime) continue;
+            BOOL enabled = object_getIvar(item, iv_enabled) ? [(id)object_getIvar(item, iv_enabled) boolValue] : NO;
+            id identObj = object_getIvar(item, iv_identifier);
+            if (![identObj isKindOfClass:[NSString class]] || ![identObj length]) continue;
+            NSString *identifier = identObj;
+            NSString *statePrefix = enabled ? @"on" : @"off";
+            NSString *path = [NSString stringWithFormat:@"/var/mobile/TrollOpenJB/ShortcutIcons/tools/%@-%@.png",
+                              statePrefix, identifier];
+            if (![fm fileExistsAtPath:path]) continue;
+            UIImage *img = [UIImage imageWithContentsOfFile:path];
+            if (!img) continue;
+            object_setIvar(item, iv_iconImage, img);
+            dirty = YES;
+            AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state icon applied: %@ (on=%d)", path, enabled]));
+        } @catch (NSException *e) {
+            // 单个条目失败不影响其余
         }
     }
-    if (!stateIds.count) return;
-
-    static NSMutableDictionary *lastSwap; // identifier → 上次使用的状态图路径
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ lastSwap = [NSMutableDictionary dictionary]; });
-
-    for (NSString *sid in stateIds) {
-        BOOL on = axs_trollopenfix_toolIsOn(sid);
-        NSString *src = [NSString stringWithFormat:@"%@/%@-%@.png", toolsDir, on ? @"on" : @"off", sid];
-        NSString *lastSrc = lastSwap[sid];
-        if (lastSrc && [lastSrc isEqualToString:src]) continue; // 状态没变
-        // 找到普通图标文件（任意名-<id>.png）并覆盖
-        NSString *suffix = [NSString stringWithFormat:@"-%@.png", sid];
-        for (NSString *f in files) {
-            if ([f hasPrefix:@"on-"] || [f hasPrefix:@"off-"] || [f hasPrefix:@"-"]) continue;
-            if (![f hasSuffix:suffix]) continue;
-            NSString *normalPath = [toolsDir stringByAppendingPathComponent:f];
-            NSData *data = [NSData dataWithContentsOfFile:src];
-            if (data) {
-                [data writeToFile:normalPath options:NSDataWritingAtomic error:nil];
-                lastSwap[sid] = src;
-                AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"state icon swapped: %@ → %@ (on=%d)", src, normalPath, on]));
+    if (dirty) {
+        // 触发 collectionView 刷新
+        @try {
+            Ivar cvIvar = class_getInstanceVariable(object_getClass(manager), "_collectionView");
+            if (!cvIvar) cvIvar = class_getInstanceVariable(object_getClass(manager), "_menuCollectionView");
+            if (cvIvar) {
+                id cv = object_getIvar(manager, cvIvar);
+                if ([cv isKindOfClass:[UICollectionView class]]) {
+                    [cv reloadData];
+                }
             }
-            break;
-        }
+        } @catch (NSException *e) {}
     }
 }
 
@@ -624,15 +647,13 @@ static const uint8_t axs_trollopenfix_iconReloadPrologue[8] = {0x7f, 0x23, 0x03,
 
 static void (*axs_trollopenfix_orig_iconReload)(void *self, void *cmd);
 static void axs_trollopenfix_new_iconReload(void *self, void *cmd) {
-    // 在原始图标加载之前，把正确的状态图放到 -<id>.png 探测路径上
-    if (axs_trollopenfix_enabled()) {
-        @try {
-            axs_trollopenfix_prepareStateIconFiles();
-        } @catch (NSException *e) {
-            NSLog(@"[TrollOpenFix] state file prep exception (suppressed)");
-        }
-    }
     axs_trollopenfix_orig_iconReload(self, cmd);
+    if (!axs_trollopenfix_enabled()) return;
+    @try {
+        axs_trollopenfix_applyMenuStateIcons((__bridge id)self);
+    } @catch (NSException *e) {
+        NSLog(@"[TrollOpenFix] menu state icon exception (suppressed)");
+    }
 }
 
 static void axs_trollopenfix_hookMenuIconReload(void) {
