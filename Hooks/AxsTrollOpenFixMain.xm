@@ -637,7 +637,7 @@ static NSString *axs_trollopenfix_toolsDir(void) {
     return @"/var/mobile/TrollOpenJB/ShortcutIcons/tools";
 }
 
-static NSString *axs_trollopenfix_stateIconPathForChoice(NSString *identifier, AxsTrollOpenFixIconChoice choice) {
+static NSString *axs_trollopenfix_stateIconPathForChoice(NSString *identifier, NSInteger choice) {
     NSString *state = (choice == AxsTrollOpenFixIconChoiceOn) ? @"on" : @"off";
     return [NSString stringWithFormat:@"%@/%@-%@.png", axs_trollopenfix_toolsDir(),
             state, axs_trollopenfix_sanitized(identifier)];
@@ -697,8 +697,6 @@ static void axs_trollopenfix_new_didSelect(id self, SEL _cmd, id tableView, id i
                                     objc_setAssociatedObject(self, &axs_trollopenfix_pendingResetKey, @YES, OBJC_ASSOCIATION_RETAIN);
                                     NSString *sid = axs_trollopenfix_sanitized(identifier);
                                     NSString *suffixDash = [NSString stringWithFormat:@"-%@.png", sid];
-                                    NSString *suffixState = [NSString stringWithFormat:@"-%@.png", sid];
-                                    NSFileManager *fm = [NSFileManager defaultManager];
                                     for (NSString *dir in (@[tools, @"/var/mobile/TrollOpenJB/ShortcutIcons"])) {
                                         NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
                                         for (NSString *f in files) {
