@@ -427,7 +427,7 @@ static void axs_trollopenfix_new_handleOpenRequest(id self, SEL _cmd, id request
     // 清理路径无可释放对象，杜绝 objc_retain/release 踩到非法值。
     axs_trollopenfix_orig_handleOpenRequest(self, _cmd, request, options, activationSettings, origin, withResult);
     @try {
-        axs_trollopenfix_handleRouteEvent(request, options, activationSettings, origin, nil, nil);
+        axs_trollopenfix_handleRouteEvent(request, options, activationSettings, origin, nil);
     } @catch (NSException *e) {
         // 只记静态日志，不触碰异常对象，避免二次崩溃。
         NSLog(@"[TrollOpenFix] handleOpenRequest route processing exception (suppressed)");
@@ -438,7 +438,7 @@ static void axs_trollopenfix_new_openURLCore(id self, SEL _cmd, id url, id displ
                                              id activationSettings, id origin, id withResult) {
     axs_trollopenfix_orig_openURLCore(self, _cmd, url, display, animating, activationSettings, origin, withResult);
     @try {
-        axs_trollopenfix_handleRouteEvent(nil, nil, activationSettings, origin, url, nil);
+        axs_trollopenfix_handleRouteEvent(nil, nil, activationSettings, origin, url);
     } @catch (NSException *e) {
         // 只记静态日志，不触碰异常对象，避免二次崩溃。
         NSLog(@"[TrollOpenFix] openURLCore route processing exception (suppressed)");
