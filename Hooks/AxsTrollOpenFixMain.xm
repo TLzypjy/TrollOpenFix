@@ -1,6 +1,8 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach-o/dyld.h>
+#import <substrate.h>
 #import "AxsTrollOpenFixConfig.h"
 #import "AxsTrollOpenFixPrivate.h"
 
@@ -475,6 +477,175 @@ static void axs_trollopenfix_hookRouteMethods(void) {
     }
 }
 
+// 与原实现一致的文件名净化：非法字符替换为下划线，空串回退 "shortcut"。
+static NSString *axs_trollopenfix_sanitized(NSString *s) {
+    if (![s isKindOfClass:[NSString class]]) return @"shortcut";
+    NSMutableString *out = [s mutableCopy];
+    NSCharacterSet *forbidden = [NSCharacterSet characterSetWithCharactersInString:@"/:?%*|\"<>"];
+    for (NSInteger i = (NSInteger)out.length - 1; i >= 0; i--) {
+        unichar c = [out characterAtIndex:(NSUInteger)i];
+        if ([forbidden characterIsMember:c]) {
+            [out replaceCharactersAtIndex:NSMakeRange((NSUInteger)i, 1) withString:@"_"];
+        }
+    }
+    return out.length ? out : @"shortcut";
+}
+
+#pragma mark - 系统工具双态图标（渲染侧，SpringBoard）
+
+// 约定文件：/var/mobile/TrollOpenJB/ShortcutIcons/tools/on-<identifier>.png / off-<identifier>.png
+// 由偏好面板侧写入；菜单图标重载完成后按 stateEnabled 换上对应状态图。
+
+static void axs_trollopenfix_applyMenuStateIcons(id manager) {
+    Class itemCls = objc_getClass("TOJBClass031");
+    if (!itemCls || !manager) return;
+    // 菜单项集合在管理类偏移 0x28 的 ivar（与原实现一致，ivar 名被混淆故按偏移取）。
+    static Ivar itemsIvar;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        unsigned count = 0;
+        Ivar *ivars = class_copyIvarList(object_getClass(manager), &count);
+        for (unsigned i = 0; i < count; i++) {
+            ptrdiff_t off = ivar_getOffset(ivars[i]);
+            if (off == 0x28) { itemsIvar = ivars[i]; break; }
+        }
+        free(ivars);
+    });
+    if (!itemsIvar) return;
+    id items = object_getIvar(manager, itemsIvar);
+    if (![items isKindOfClass:[NSArray class]]) return;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL dirty = NO;
+    for (id item in items) {
+        if (![item isKindOfClass:itemCls]) continue;
+        @try {
+            NSNumber *stateful = [item valueForKey:@"stateful"];
+            NSNumber *runtime = [item valueForKey:@"hasRuntimeState"];
+            if (!stateful.boolValue || !runtime.boolValue) continue;
+            NSString *identifier = [item valueForKey:@"identifier"];
+            NSNumber *enabled = [item valueForKey:@"stateEnabled"];
+            if (![identifier isKindOfClass:[NSString class]] || identifier.length == 0) continue;
+            NSString *path = [NSString stringWithFormat:@"/var/mobile/TrollOpenJB/ShortcutIcons/tools/%@-%@.png",
+                              enabled.boolValue ? @"on" : @"off", identifier];
+            if (![fm fileExistsAtPath:path]) continue;
+            UIImage *img = [UIImage imageWithContentsOfFile:path];
+            if (!img) continue;
+            id current = [item valueForKey:@"iconImage"];
+            if (current == img) continue;
+            [item setValue:img forKey:@"iconImage"];
+            dirty = YES;
+        } @catch (NSException *e) {
+            // 单个条目失败不影响其余条目。
+        }
+    }
+    if (dirty) {
+        @try {
+            id collectionView = [manager valueForKey:@"collectionView"];
+            if ([collectionView isKindOfClass:[UICollectionView class]]) {
+                [collectionView reloadData];
+            }
+        } @catch (NSException *e) {}
+    }
+}
+
+// TrollOpenJB.dylib 内图标重载函数的文件偏移（1.5.2+offline.5 arm64e 切片）。
+#define AXS_TROLLOPEN_FIX_ICON_RELOAD_OFFSET 0x5f8ca4ull
+// 期望的函数前 8 字节（stp d15,d14,[sp,#-0xa0]! / stp d13,d12,[sp,#0x10]），校验失败则不挂钩，防版本漂移误伤。
+static const uint8_t axs_trollopenfix_iconReloadPrologue[8] = {0xef, 0x3b, 0xb6, 0x6d, 0xed, 0x33, 0x01, 0x6d};
+
+static void (*axs_trollopenfix_orig_iconReload)(void *self, void *cmd);
+static void axs_trollopenfix_new_iconReload(void *self, void *cmd) {
+    axs_trollopenfix_orig_iconReload(self, cmd);
+    if (!axs_trollopenfix_enabled()) return;
+    @try {
+        axs_trollopenfix_applyMenuStateIcons((__bridge id)self);
+    } @catch (NSException *e) {
+        NSLog(@"[TrollOpenFix] menu state icon exception (suppressed)");
+    }
+}
+
+static void axs_trollopenfix_hookMenuIconReload(void) {
+    uintptr_t base = 0;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name) {
+            size_t len = strlen(name);
+            size_t suf = strlen("TrollOpenJB.dylib");
+            if (len > suf && strcmp(name + len - suf, "TrollOpenJB.dylib") == 0) {
+                base = (uintptr_t)_dyld_get_image_header(i);
+                break;
+            }
+        }
+    }
+    if (!base) return;
+    uintptr_t target = base + AXS_TROLLOPEN_FIX_ICON_RELOAD_OFFSET;
+    if (memcmp((const void *)target, axs_trollopenfix_iconReloadPrologue, sizeof(axs_trollopenfix_iconReloadPrologue)) != 0) {
+        AXS_TROLLOPEN_FIX_LOG(@"icon reload prologue mismatch, skip hook");
+        return;
+    }
+    MSHookFunction((void *)target, (void *)axs_trollopenfix_new_iconReload, (void **)&axs_trollopenfix_orig_iconReload);
+    AXS_TROLLOPEN_FIX_LOG(@"menu icon reload hooked");
+}
+
+#pragma mark - 系统工具双态图标（偏好面板侧，Settings）
+
+static void (*axs_trollopenfix_orig_didFinishPicking)(id, SEL, id, id);
+static void axs_trollopenfix_new_didFinishPicking(id self, SEL _cmd, id picker, id info) {
+    axs_trollopenfix_orig_didFinishPicking(self, _cmd, picker, info);
+    @try {
+        if (!axs_trollopenfix_enabled()) return;
+        Class listCls = objc_getClass("TOJFanMenuListController");
+        if (!listCls || ![self isKindOfClass:listCls]) return;
+        NSDictionary *item = axs_trollopenfix_safeGet(self, @"pendingIconItem");
+        if (![item isKindOfClass:[NSDictionary class]]) return;
+        NSNumber *stateful = item[@"stateful"];
+        if (!stateful.boolValue) return;
+        NSString *identifier = item[@"identifier"];
+        if (![identifier isKindOfClass:[NSString class]] || identifier.length == 0) return;
+        NSString *normal = [NSString stringWithFormat:@"/var/mobile/TrollOpenJB/ShortcutIcons/tools/on-%@.png", identifier];
+        // 保存流程先落盘普通图标；这里确认用户是否要把它用作状态图标。
+        // 状态图标与普通图标相互独立（on-/off- 前缀），因此复制时机不依赖刚保存的文件内容。
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"TrollOpen 双态图标"
+                                    message:@"是否将图标用于工具的开启/关闭状态？（on-/off- 前缀文件，可在 Filza 中替换为不同图片）"
+                                    preferredStyle:UIAlertControllerStyleAlert];
+        NSString *toolsDir = @"/var/mobile/TrollOpenJB/ShortcutIcons/tools";
+        void (^copyDefault)(NSString *) = ^(NSString *state) {
+            // 默认以当前普通图标为底本；不存在则不复制（用户可稍后自行放置对应文件）。
+            NSString *src = [NSString stringWithFormat:@"%@/%@-%@.png", toolsDir,
+                             axs_trollopenfix_sanitized([item valueForKey:@"title"] ?: @""),
+                             axs_trollopenfix_sanitized(identifier)];
+            NSString *dst = [NSString stringWithFormat:@"%@/%@-%@.png", toolsDir, state, axs_trollopenfix_sanitized(identifier)];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if ([fm fileExistsAtPath:src]) {
+                [fm removeItemAtPath:dst error:nil];
+                [fm copyItemAtPath:src toPath:dst error:nil];
+            } else {
+                [fm createFileAtPath:dst contents:nil attributes:nil];
+            }
+        };
+        [alert addAction:[UIAlertAction actionWithTitle:@"设为开启状态图标" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { copyDefault(@"on"); }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"设为关闭状态图标" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { copyDefault(@"off"); }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"两种状态都用" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { copyDefault(@"on"); copyDefault(@"off"); }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        UIViewController *top = [self presentedViewController] ?: self;
+        [top presentViewController:alert animated:YES completion:nil];
+    } @catch (NSException *e) {
+        NSLog(@"[TrollOpenFix] prefs state icon exception (suppressed)");
+    }
+}
+
+static void axs_trollopenfix_hookPrefsIconFlow(void) {
+    Class listCls = objc_getClass("TOJFanMenuListController");
+    if (!listCls) return;
+    SEL sel = @selector(imagePickerController:didFinishPickingMediaWithInfo:);
+    IMP imp = axs_trollopenfix_replaceOwnMethod(listCls, sel, (IMP)axs_trollopenfix_new_didFinishPicking);
+    if (imp) {
+        axs_trollopenfix_orig_didFinishPicking = (void (*)(id, SEL, id, id))imp;
+        AXS_TROLLOPEN_FIX_LOG(@"prefs icon flow hooked");
+    }
+}
+
 #pragma mark - 入口
 
 %ctor {
@@ -484,6 +655,8 @@ static void axs_trollopenfix_hookRouteMethods(void) {
             // 等 TrollOpen 完成自身初始化后再挂接。
             axs_trollopenfix_hookFloatingWindowClass();
             axs_trollopenfix_hookRouteMethods();
+            axs_trollopenfix_hookMenuIconReload();
+            axs_trollopenfix_hookPrefsIconFlow();
         });
     }
 }
