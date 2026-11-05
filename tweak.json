@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "name": "TrollOpenFix",
+  "id": "trollopenfix",
+  "display_name": "TrollOpen 修复",
+  "class_prefix": "AxsTrollOpenFix",
+  "symbol_prefix": "axs_trollopenfix",
+  "package": "com.axs.trollopenfix",
+  "bundle": "com.apple.springboard",
+  "sdk_version": "16.5",
+  "minimum_ios": "14.0",
+  "preferences": false,
+  "slider": false,
+  "github_actions": true
+}

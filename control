@@ -1,0 +1,11 @@
+Package: com.axs.trollopenfix
+Name: TrollOpen 修复
+Version: 5.2.0
+Architecture: iphoneos-arm
+Description: TrollOpen 修复
+Maintainer: Axs
+Author: Axs
+Section: Axs-Tweaks
+Depends: mobilesubstrate
+Icon: https://axs66.github.io/pro/icon/trollopenfix.png
+Sileodepiction: https://axs66.github.io/pro/sileodepiction/trollopenfix/js.json
