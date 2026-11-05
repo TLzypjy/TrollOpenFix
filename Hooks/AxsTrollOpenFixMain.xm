@@ -409,7 +409,7 @@ static void axs_trollopenfix_hookFloatingWindowClass(void) {
 
 #pragma mark - SpringBoard 路由 hook
 
-static void (*axs_trollopenfix_orig_handleOpenRequest)(id, SEL, id, id, id, id, id, id);
+static void (*axs_trollopenfix_orig_handleOpenRequest)(id, SEL, id, id, id, id, id);
 static void (*axs_trollopenfix_orig_openURLCore)(id, SEL, id, id, id, id, id, id);
 
 static void axs_trollopenfix_new_handleOpenRequest(id self, SEL _cmd, id request, id options,
@@ -440,7 +440,7 @@ static void axs_trollopenfix_hookRouteMethods(void) {
         SEL sel = NSSelectorFromString(@"_handleOpenApplicationRequest:options:activationSettings:origin:withResult:");
         IMP imp = axs_trollopenfix_replaceOwnMethod(wsClass, sel, (IMP)axs_trollopenfix_new_handleOpenRequest);
         if (imp) {
-            axs_trollopenfix_orig_handleOpenRequest = (void (*)(id, SEL, id, id, id, id, id, id))imp;
+            axs_trollopenfix_orig_handleOpenRequest = (void (*)(id, SEL, id, id, id, id, id))imp;
             AXS_TROLLOPEN_FIX_LOG(@"SBMainWorkspace _handleOpenApplicationRequest hooked");
         } else {
             AXS_TROLLOPEN_FIX_LOG(@"SBMainWorkspace route method unavailable");
