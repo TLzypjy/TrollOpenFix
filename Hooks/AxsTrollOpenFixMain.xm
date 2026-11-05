@@ -28,7 +28,7 @@ static void axs_trollopenfix_writeLog(NSString *msg) {
             [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
             [fh closeFile];
         } else {
-            [line writeToFile:path atomically:YES];
+            [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }
     } @catch (NSException *e) {
         // 日志失败不影响功能。
