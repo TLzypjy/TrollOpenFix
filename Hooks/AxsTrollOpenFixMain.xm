@@ -620,10 +620,6 @@ static void axs_trollopenfix_prepareStateIconFiles(void) {
     }
 }
 
-static void axs_trollopenfix_applyMenuStateIcons(id manager) {
-    // 不再需要复杂的 item model 遍历
-}
-
 // TrollOpenJB.dylib 内图标重载函数的偏移。运行时加载的是 arm64e 切片（fat 的
 // sub=0x80000002），偏移按该切片计算；arm64 切片(0x5f8ca4)与 arm64e(0x610ad0)不同。
 #define AXS_TROLLOPEN_FIX_ICON_RELOAD_OFFSET 0x610ad0ull
