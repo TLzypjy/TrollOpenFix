@@ -38,16 +38,24 @@ static BOOL axs_trollopenfix_looksLikeBundleID(NSString *s) {
 
 // 无异常取值：只探测 getter 形式的方法，不使用 KVC（KVC 对未知键会抛
 // NSUndefinedKeyException，在 SpringBoard 热路径上风险过高）。
+// 额外校验方法返回类型必须是对象（'@'），防止 -(NSUInteger)identifier 之类的
+// 标量 getter 返回值被当作 id 使用（曾导致 objc_retain(0x1) 崩溃）。
 static id axs_trollopenfix_safeGet(id obj, NSString *key) {
     if (!obj || key.length == 0) return nil;
     SEL sel = NSSelectorFromString(key);
-    if ([(id)object_getClass(obj) respondsToSelector:sel]) {
-        return ((id(*)(id, SEL))objc_msgSend)(obj, sel);
+    Class cls = object_getClass(obj);
+    if (!cls || ![(id)cls respondsToSelector:sel]) {
+        if ([obj isKindOfClass:[NSDictionary class]]) {
+            return [(NSDictionary *)obj objectForKey:key];
+        }
+        return nil;
     }
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        return [(NSDictionary *)obj objectForKey:key];
+    Method m = class_getInstanceMethod(cls, sel);
+    const char *types = m ? method_getTypeEncoding(m) : NULL;
+    if (!types || types[0] != '@') {
+        return nil; // 标量/结构体返回值一律不碰
     }
-    return nil;
+    return ((id(*)(id, SEL))objc_msgSend)(obj, sel);
 }
 
 // 从任意 SpringBoard 对象中尽量提取 bundle id；只做 getter 探测，结构上无异常。
@@ -214,7 +222,7 @@ static void axs_trollopenfix_processRoutePair(NSString *source, NSString *target
 #pragma mark - 路由事件提取
 
 static void axs_trollopenfix_handleRouteEvent(id request, id options, id activationSettings,
-                                              id origin, id urlCandidate, NSString *preFrontmost) {
+                                              id origin, id urlCandidate) {
     if (!axs_trollopenfix_enabled()) return;
 
     NSString *source = axs_trollopenfix_extractBundleID(origin);
@@ -225,7 +233,7 @@ static void axs_trollopenfix_handleRouteEvent(id request, id options, id activat
     NSString *target = axs_trollopenfix_extractBundleID(request);
     if (!target) target = axs_trollopenfix_extractBundleID(activationSettings);
 
-    // 兜底 1：来源缺失但事件带 URL（多为应用回调 openURL），用调用发生前的前台应用兜底。
+    // 事件带 URL（多为应用回调 openURL）：记录 URL 字符串供日志定位。
     NSString *urlString = nil;
     id u = axs_trollopenfix_safeGet(request, @"URL") ?: axs_trollopenfix_safeGet(request, @"url");
     if ([u isKindOfClass:[NSURL class]]) urlString = [(NSURL *)u absoluteString];
@@ -233,12 +241,8 @@ static void axs_trollopenfix_handleRouteEvent(id request, id options, id activat
     if (urlCandidate && !urlString) {
         urlString = [urlCandidate isKindOfClass:[NSURL class]] ? [(NSURL *)urlCandidate absoluteString] : nil;
     }
-    if (!source && urlString.length > 0 && preFrontmost
-        && ![preFrontmost hasPrefix:@"com.apple.springboard"]) {
-        source = preFrontmost;
-    }
 
-    // 兜底 2：目标缺失时用 0.8s 后的前台应用（跳转完成后目标必然在前台）。
+    // 目标缺失时用 0.8s 后的前台应用（跳转完成后目标必然在前台）。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @try {
@@ -419,10 +423,11 @@ static void (*axs_trollopenfix_orig_openURLCore)(id, SEL, id, id, id, id, id, id
 
 static void axs_trollopenfix_new_handleOpenRequest(id self, SEL _cmd, id request, id options,
                                                    id activationSettings, id origin, id withResult) {
-    NSString *preFrontmost = axs_trollopenfix_frontmostIdentifier();
+    // wrapper 不持有任何跨 %orig 的强引用对象：若异常穿过本栈帧，
+    // 清理路径无可释放对象，杜绝 objc_retain/release 踩到非法值。
     axs_trollopenfix_orig_handleOpenRequest(self, _cmd, request, options, activationSettings, origin, withResult);
     @try {
-        axs_trollopenfix_handleRouteEvent(request, options, activationSettings, origin, nil, preFrontmost);
+        axs_trollopenfix_handleRouteEvent(request, options, activationSettings, origin, nil, nil);
     } @catch (NSException *e) {
         // 只记静态日志，不触碰异常对象，避免二次崩溃。
         NSLog(@"[TrollOpenFix] handleOpenRequest route processing exception (suppressed)");
@@ -431,10 +436,9 @@ static void axs_trollopenfix_new_handleOpenRequest(id self, SEL _cmd, id request
 
 static void axs_trollopenfix_new_openURLCore(id self, SEL _cmd, id url, id display, id animating,
                                              id activationSettings, id origin, id withResult) {
-    NSString *preFrontmost = axs_trollopenfix_frontmostIdentifier();
     axs_trollopenfix_orig_openURLCore(self, _cmd, url, display, animating, activationSettings, origin, withResult);
     @try {
-        axs_trollopenfix_handleRouteEvent(nil, nil, activationSettings, origin, url, preFrontmost);
+        axs_trollopenfix_handleRouteEvent(nil, nil, activationSettings, origin, url, nil);
     } @catch (NSException *e) {
         // 只记静态日志，不触碰异常对象，避免二次崩溃。
         NSLog(@"[TrollOpenFix] openURLCore route processing exception (suppressed)");
