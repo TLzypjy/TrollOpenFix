@@ -485,7 +485,8 @@ static NSString *axs_trollopenfix_sanitized(NSString *s) {
     for (NSInteger i = (NSInteger)out.length - 1; i >= 0; i--) {
         unichar c = [out characterAtIndex:(NSUInteger)i];
         if ([forbidden characterIsMember:c]) {
-            [out replaceCharactersAtIndex:NSMakeRange((NSUInteger)i, 1) withString:@"_"];
+            [out deleteCharactersInRange:NSMakeRange((NSUInteger)i, 1)];
+            [out insertString:@"_" atIndex:(NSUInteger)i];
         }
     }
     return out.length ? out : @"shortcut";
@@ -603,7 +604,6 @@ static void axs_trollopenfix_new_didFinishPicking(id self, SEL _cmd, id picker, 
         if (!stateful.boolValue) return;
         NSString *identifier = item[@"identifier"];
         if (![identifier isKindOfClass:[NSString class]] || identifier.length == 0) return;
-        NSString *normal = [NSString stringWithFormat:@"/var/mobile/TrollOpenJB/ShortcutIcons/tools/on-%@.png", identifier];
         // 保存流程先落盘普通图标；这里确认用户是否要把它用作状态图标。
         // 状态图标与普通图标相互独立（on-/off- 前缀），因此复制时机不依赖刚保存的文件内容。
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"TrollOpen 双态图标"
