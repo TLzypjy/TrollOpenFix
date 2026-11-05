@@ -573,7 +573,7 @@ static BOOL axs_trollopenfix_toolIsOn(NSString *identifier) {
 // 在菜单图标加载前，检查每个有 on-/off- 底稿的工具，将正确状态的图覆盖到普通图标路径。
 // 普通图标路径 = tools/<标题>-<标识>.png（原始代码探测的第一个路径）。
 static void axs_trollopenfix_prepareStateIconFiles(void) {
-    NSString *toolsDir = axs_trollopenfix_toolsDir();
+    NSString *toolsDir = @"/var/mobile/TrollOpenJB/ShortcutIcons/tools";
     NSFileManager *fm = [NSFileManager defaultManager];
     NSArray *files = [fm contentsOfDirectoryAtPath:toolsDir error:nil];
     if (!files.count) return;
