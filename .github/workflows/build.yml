@@ -11,14 +11,12 @@ permissions:
   contents: write
 
 env:
-  HOMEBREW_NO_AUTO_UPDATE: 1
-  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
-  THEOS: ${{ github.workspace }}/theos-roothide
+  THEOS: ${{ github.workspace }}/theos
 
 jobs:
   build:
     name: Build (${{ matrix.build_variant }})
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     outputs:
       package_version: ${{ steps.bump.outputs.package_version }}
     strategy:
@@ -30,10 +28,12 @@ jobs:
           - build_variant: roothide
 
     steps:
-      - name: Setup Xcode
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: '15.4'
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git libxml2 libtinfo6 unzip xz-utils dpkg
+          curl -L "https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64" -o /tmp/ldid
+          sudo install -m755 /tmp/ldid /usr/local/bin/ldid
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,15 +49,15 @@ jobs:
         run: |
           VERSION="5.2.0-${{ github.run_number }}"
           echo "Using version: $VERSION"
-          sed -i '' "s/^Version: .*/Version: ${VERSION}/" control
+          sed -i "s/^Version: .*/Version: ${VERSION}/" control
           echo "package_version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout Theos (RootHide)
-        uses: actions/checkout@v4
-        with:
-          repository: roothide/theos
-          path: theos-roothide
-          submodules: recursive
+      - name: Setup Theos (RootHide)
+        run: |
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git "$THEOS"
+          curl -L "https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolChain-x86_64.tar.xz" -o /tmp/toolchain.tar.xz
+          mkdir -p "$THEOS/toolchain"
+          tar -xJf /tmp/toolchain.tar.xz -C "$THEOS/toolchain"
 
       - name: Install iOS SDK (iPhoneOS16.5)
         run: |
@@ -67,17 +67,14 @@ jobs:
             echo "iPhoneOS16.5.sdk already present"
             exit 0
           fi
-          SDK_STAGE="$(mktemp -d)"
-          trap 'rm -rf "$SDK_STAGE"' EXIT
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$SDK_STAGE/sdks"
-          git -C "$SDK_STAGE/sdks" sparse-checkout set iPhoneOS16.5.sdk
-          cp -R "$SDK_STAGE/sdks/iPhoneOS16.5.sdk" "$THEOS/sdks/"
+          if ! "$THEOS/bin/install-sdk" 16.5; then
+            SDK_STAGE="$(mktemp -d)"
+            trap 'rm -rf "$SDK_STAGE"' EXIT
+            git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$SDK_STAGE/sdks"
+            git -C "$SDK_STAGE/sdks" sparse-checkout set iPhoneOS16.5.sdk
+            cp -R "$SDK_STAGE/sdks/iPhoneOS16.5.sdk" "$THEOS/sdks/"
+          fi
           ls -1 "$THEOS/sdks"
-
-      - name: Install Theos dependencies
-        run: |
-          brew install ldid dpkg xz
-          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
 
       - name: Build Package
         run: |
