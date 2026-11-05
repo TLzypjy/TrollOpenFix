@@ -701,7 +701,7 @@ static void axs_trollopenfix_new_didSelect(id self, SEL _cmd, id tableView, id i
                                         NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
                                         for (NSString *f in files) {
                                             BOOL isState = [f hasPrefix:@"on-"] || [f hasPrefix:@"off-"];
-                                            BOOL hit = [f hasSuffix:suffixDash] || (isState && [f hasSuffix:suffixState]);
+                                            BOOL hit = [f hasSuffix:suffixDash];
                                             if (!hit) continue;
                                             NSString *full = [dir stringByAppendingPathComponent:f];
                                             if ([fm removeItemAtPath:full error:nil]) {
