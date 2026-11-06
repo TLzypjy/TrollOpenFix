@@ -3,6 +3,7 @@
 #import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <math.h>
+#import <string.h>
 #import "AxsTrollOpenFixConfig.h"
 #import "AxsTrollOpenFixPrivate.h"
 
