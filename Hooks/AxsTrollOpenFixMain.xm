@@ -545,7 +545,7 @@ static void axs_fix_hookSelector(Class cls, SEL sel, IMP newImp, NSMutableDictio
     [hooked addObject:mk];
     IMP orig = method_getImplementation(m);
     method_setImplementation(m, newImp);
-    map[[NSValue valueWithNonretainedObject:(id)cls]] = [NSValue valueWithPointer:orig];
+    map[[NSValue valueWithNonretainedObject:(id)cls]] = [NSValue valueWithPointer:(void *)orig];
     NSString *msg = [NSString stringWithFormat:@"hooked %@ on %@", NSStringFromSelector(sel), label];
     AXS_TROLLOPEN_FIX_LOG(msg);
 }
