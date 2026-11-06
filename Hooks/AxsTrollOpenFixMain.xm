@@ -255,6 +255,7 @@ static NSMutableSet *axs_fix_setFrameMethods;
 static NSMutableSet *axs_fix_layoutMethods;
 static NSMutableSet *axs_fix_miniModeMethods;
 static BOOL axs_fix_inOwnSnap = NO;                   // 我们自己的贴边动画触发的 setCenter: 不回环处理
+static CFAbsoluteTime axs_fix_transitionUntil = 0;    // 全屏/关闭过渡期间暂停我们的贴边逻辑，避免和原生动画打架
 
 static void axs_fix_initState(void) {
     static dispatch_once_t once;
@@ -343,6 +344,7 @@ static void axs_fix_settleSnap(UIView *view, NSInteger attempt) {
     if (!view || attempt >= 6) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        if (CFAbsoluteTimeGetCurrent() < axs_fix_transitionUntil) return;
         if (!axs_trollopenfix_enabled() || !view.window) return;
         NSNumber *touching = objc_getAssociatedObject(view, AxsFixTouchingKey);
         if (touching.boolValue) return; // 用户又抓住了
@@ -365,27 +367,77 @@ static BOOL axs_fix_closeWindow(id primary) {
     return NO;
 }
 
+// 下划全屏：只走 TrollOpen 原生动作（带完整过渡流程），绝不直接调 setMiniWindowModeEnabled:
+// （直接调 setter 会绕过过渡机制，窗口会卡在半过渡状态）
 static void axs_fix_goFullscreen(id view) {
-    SEL setMini = NSSelectorFromString(@"setMiniWindowModeEnabled:");
-    if ([view respondsToSelector:setMini]) {
-        ((void(*)(id, SEL, BOOL))objc_msgSend)(view, setMini, NO);
-        return;
-    }
+    axs_fix_transitionUntil = CFAbsoluteTimeGetCurrent() + 1.5;
     id target = axs_fix_state[@"miniSetterTarget"];
-    if (target && [target respondsToSelector:setMini]) {
-        ((void(*)(id, SEL, BOOL))objc_msgSend)(target, setMini, NO);
+
+    // 1) 原生高层动作：多窗模式切换到全屏（全屏按钮执行的动作）
+    SEL swapSel = NSSelectorFromString(@"performMultiScreenSwapToFullscreen");
+    if ([view respondsToSelector:swapSel]) {
+        ((void(*)(id, SEL))objc_msgSend)(view, swapSel);
+        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via performMultiScreenSwapToFullscreen");
         return;
     }
-    for (NSString *name in @[@"fullscreenCurrentFloatingWindow", @"performMultiScreenSwapToFullscreen"]) {
-        SEL sel = NSSelectorFromString(name);
-        if ([view respondsToSelector:sel]) {
-            ((void(*)(id, SEL))objc_msgSend)(view, sel);
+    if (target && [target respondsToSelector:swapSel]) {
+        ((void(*)(id, SEL))objc_msgSend)(target, swapSel);
+        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via performMultiScreenSwapToFullscreen (target)");
+        return;
+    }
+
+    // 2) 原生小窗轻点处理（小窗轻点=全屏是 TrollOpen 原生行为）
+    SEL tapSel = NSSelectorFromString(@"handleTapGesture:");
+    if ([view respondsToSelector:tapSel]) {
+        id gr = nil;
+        SEL grSel = NSSelectorFromString(@"tapGestureRecognizer");
+        Class cls = object_getClass(view);
+        Method m = cls ? class_getInstanceMethod(cls, grSel) : NULL;
+        if (m && method_getTypeEncoding(m)[0] == '@') {
+            gr = ((id(*)(id, SEL))objc_msgSend)(view, grSel);
+        }
+        ((void(*)(id, SEL, id))objc_msgSend)(view, tapSel, gr);
+        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via handleTapGesture:");
+        return;
+    }
+
+    // 3) 带完成块的变体
+    SEL cSel = NSSelectorFromString(@"performMultiScreenSwapToFullscreenWithCompletion:");
+    if ([view respondsToSelector:cSel]) {
+        ((void(*)(id, SEL, void *))objc_msgSend)(view, cSel, NULL);
+        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via performMultiScreenSwapToFullscreenWithCompletion:");
+        return;
+    }
+    if (target && [target respondsToSelector:cSel]) {
+        ((void(*)(id, SEL, void *))objc_msgSend)(target, cSel, NULL);
+        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via performMultiScreenSwapToFullscreenWithCompletion: (target)");
+        return;
+    }
+
+    // 4) 模拟点击浮窗上的全屏按钮
+    SEL btnSel = NSSelectorFromString(@"fullscreenButton");
+    Class cls = object_getClass(view);
+    Method m = cls ? class_getInstanceMethod(cls, btnSel) : NULL;
+    if (m && method_getTypeEncoding(m)[0] == '@') {
+        id btn = ((id(*)(id, SEL))objc_msgSend)(view, btnSel);
+        if ([btn isKindOfClass:[UIButton class]]) {
+            [btn sendActionsForControlEvents:UIControlEventTouchUpInside];
+            AXS_TROLLOPEN_FIX_LOG(@"fullscreen via fullscreenButton tap");
             return;
         }
-        if (target && [target respondsToSelector:sel]) {
-            ((void(*)(id, SEL))objc_msgSend)(target, sel);
-            return;
-        }
+    }
+
+    // 5) 兜底命令
+    SEL fcfSel = NSSelectorFromString(@"fullscreenCurrentFloatingWindow");
+    if ([view respondsToSelector:fcfSel]) {
+        ((void(*)(id, SEL))objc_msgSend)(view, fcfSel);
+        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via fullscreenCurrentFloatingWindow");
+        return;
+    }
+    if (target && [target respondsToSelector:fcfSel]) {
+        ((void(*)(id, SEL))objc_msgSend)(target, fcfSel);
+        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via fullscreenCurrentFloatingWindow (target)");
+        return;
     }
     AXS_TROLLOPEN_FIX_LOG(@"fullscreen: no known action available");
 }
@@ -472,6 +524,7 @@ static void axs_fix_installPan(UIView *view) {
 // 每次浮窗布局/位移后的入口：装 Pan、进入小窗时自动贴边（仅一次）
 static void axs_fix_afterLayout(id self) {
     if (!axs_trollopenfix_enabled()) return;
+    if (CFAbsoluteTimeGetCurrent() < axs_fix_transitionUntil) return; // 全屏过渡期间不插手
     if (![self isKindOfClass:[UIView class]]) return;
     UIView *view = (UIView *)self;
     if (!axs_fix_isTargetFloatingView(view)) return;
