@@ -200,8 +200,7 @@ static void axs_trollopenfix_processRoutePair(NSString *source, NSString *target
 
 #pragma mark - 小窗手势 + 贴边
 
-static char axs_trollopenfix_snapTokenKey;
-static char axs_trollopenfix_dragStartKey;
+static char axs_trollopenfix_gesturesAddedKey;
 
 static void axs_trollopenfix_snapToEdge(id win, BOOL left) {
     UIView *view = win;
@@ -240,140 +239,200 @@ static void axs_trollopenfix_closeFloatingWin(id win) {
     }
 }
 
-static void axs_trollopenfix_snapMiniWindow(id win, CGPoint dragStart) {
-    if (!win) return;
-    Class cls = axs_trollopenfix_floatingWindowClass();
-    if (!cls || ![win isKindOfClass:cls]) return;
-
-    SEL miniSel = NSSelectorFromString(@"miniWindowModeEnabled");
-    if (![win respondsToSelector:miniSel]) return;
-    BOOL mini = ((BOOL(*)(id, SEL))objc_msgSend)(win, miniSel);
-    if (!mini) return;
-
+static void axs_trollopenfix_snapNearestEdge(id win) {
     UIView *view = win;
-    if (view.hidden || view.alpha < 0.05) return;
-
-    // 计算拖动位移
-    CGPoint current = view.center;
-    CGFloat dx = current.x - dragStart.x;
-    CGFloat dy = current.y - dragStart.y;
-    CGFloat absDx = fabs(dx);
-    CGFloat absDy = fabs(dy);
-
-    AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"snap: dx=%.1f dy=%.1f", dx, dy]));
-
-    CGFloat swipeThreshold = 30.0;
-
-    // 上划 → 关闭
-    if (absDy > swipeThreshold && absDy > absDx * 1.3 && dy < 0) {
-        AXS_TROLLOPEN_FIX_LOG(@"gesture: swipe up → close");
-        axs_trollopenfix_closeFloatingWin(win);
-        return;
-    }
-    // 下划 → 全屏
-    if (absDy > swipeThreshold && absDy > absDx * 1.3 && dy > 0) {
-        AXS_TROLLOPEN_FIX_LOG(@"gesture: swipe down → fullscreen");
-        axs_trollopenfix_exitMiniMode(win);
-        return;
-    }
-    // 左划 → 贴左边
-    if (absDx > swipeThreshold && absDx > absDy * 1.3 && dx < 0) {
-        AXS_TROLLOPEN_FIX_LOG(@"gesture: swipe left → snap left");
-        axs_trollopenfix_snapToEdge(win, YES);
-        return;
-    }
-    // 右划 → 贴右边
-    if (absDx > swipeThreshold && absDx > absDy * 1.3 && dx > 0) {
-        AXS_TROLLOPEN_FIX_LOG(@"gesture: swipe right → snap right");
-        axs_trollopenfix_snapToEdge(win, NO);
-        return;
-    }
-
-    // 位移不够大 → 普通贴边（最近的边缘）
     CGRect screen = view.window ? view.window.bounds : [UIScreen mainScreen].bounds;
     if (screen.size.width <= 0) return;
-    CGRect frm = view.frame;
-    CGFloat w = CGRectGetWidth(frm);
-    if (w <= 0) return;
-
-    CGFloat outsideL = CGRectGetMinX(screen) - CGRectGetMinX(frm);
-    CGFloat outsideR = CGRectGetMaxX(frm) - CGRectGetMaxX(screen);
-    if (outsideL > w * 0.25 || outsideR > w * 0.25) return;
-
     CGFloat margin = 8.0;
+    CGFloat w = CGRectGetWidth(view.frame);
+    CGFloat halfH = CGRectGetHeight(view.frame) / 2.0;
     CGFloat targetX = (view.center.x < CGRectGetMidX(screen))
         ? CGRectGetMinX(screen) + margin + w / 2.0
         : CGRectGetMaxX(screen) - margin - w / 2.0;
-    CGFloat halfH = CGRectGetHeight(frm) / 2.0;
     CGFloat targetY = MIN(MAX(view.center.y, CGRectGetMinY(screen) + margin + halfH),
                           CGRectGetMaxY(screen) - margin - halfH);
-    if (fabs(targetX - view.center.x) < 1.0 && fabs(targetY - view.center.y) < 1.0) return;
     [UIView animateWithDuration:0.15 delay:0
         options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
         animations:^{ view.center = CGPointMake(targetX, targetY); }
         completion:nil];
 }
 
-// 带代际令牌的防抖：拖动中不触发，最后一次 setCenter 后 30ms 触发。
-static void axs_trollopenfix_scheduleMiniSnap(id win) {
-    if (!win) return;
-    NSInteger generation = [objc_getAssociatedObject(win, &axs_trollopenfix_snapTokenKey) integerValue] + 1;
-    objc_setAssociatedObject(win, &axs_trollopenfix_snapTokenKey, @(generation), OBJC_ASSOCIATION_RETAIN);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if ([objc_getAssociatedObject(win, &axs_trollopenfix_snapTokenKey) integerValue] != generation) {
-            return;
-        }
-        objc_setAssociatedObject(win, &axs_trollopenfix_snapTokenKey, nil, OBJC_ASSOCIATION_RETAIN);
-        CGPoint dragStart = [objc_getAssociatedObject(win, &axs_trollopenfix_dragStartKey) CGPointValue];
-        axs_trollopenfix_snapMiniWindow(win, dragStart);
-        objc_setAssociatedObject(win, &axs_trollopenfix_dragStartKey, nil, OBJC_ASSOCIATION_RETAIN);
-    });
+// 手势回调：方向滑动 → 对应操作
+static void axs_trollopenfix_handleSwipe(id win, NSInteger direction) {
+    switch (direction) {
+        case UISwipeGestureRecognizerDirectionUp:
+            AXS_TROLLOPEN_FIX_LOG(@"gesture: swipe up → close");
+            axs_trollopenfix_closeFloatingWin(win);
+            break;
+        case UISwipeGestureRecognizerDirectionDown:
+            AXS_TROLLOPEN_FIX_LOG(@"gesture: swipe down → fullscreen");
+            axs_trollopenfix_exitMiniMode(win);
+            break;
+        case UISwipeGestureRecognizerDirectionLeft:
+            AXS_TROLLOPEN_FIX_LOG(@"gesture: swipe left → snap left");
+            axs_trollopenfix_snapToEdge(win, YES);
+            break;
+        case UISwipeGestureRecognizerDirectionRight:
+            AXS_TROLLOPEN_FIX_LOG(@"gesture: swipe right → snap right");
+            axs_trollopenfix_snapToEdge(win, NO);
+            break;
+    }
 }
 
-#pragma mark - TOJBClass012 swizzle
+// ObjC 手势处理类
+@interface AxsTrollOpenFixGestureTarget : NSObject
+@end
+@implementation AxsTrollOpenFixGestureTarget
+- (void)handleSwipe:(UISwipeGestureRecognizer *)gr {
+    UIView *view = gr.view;
+    if (view) axs_trollopenfix_handleSwipe(view, gr.direction);
+}
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gr shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+    return NO;
+}
+@end
 
-static void (*axs_trollopenfix_orig_setMiniWindowModeEnabled)(id, SEL, BOOL);
-static void (*axs_trollopenfix_orig_setCenter)(id, SEL, CGPoint);
-static void (*axs_trollopenfix_orig_setFrame)(id, SEL, CGRect);
+static AxsTrollOpenFixGestureTarget *axs_trollopenfix_gestureTarget;
+static char axs_trollopenfix_gesturesKey;
 
-static BOOL axs_trollopenfix_miniModeEnabled(id win) {
-    SEL sel = NSSelectorFromString(@"miniWindowModeEnabled");
-    if (![win respondsToSelector:sel]) return NO;
-    if (!((BOOL(*)(id, SEL))objc_msgSend)(win, sel)) return NO;
-    // 额外检查窗口尺寸：大窗（分屏模式）不启用手势，只有小窗尺寸才触发
+// 进入小窗模式时：贴最近边 + 添加滑动手势
+static void axs_trollopenfix_onEnterMiniMode(id win) {
+    axs_trollopenfix_snapNearestEdge(win);
+
+    if (objc_getAssociatedObject(win, &axs_trollopenfix_gesturesKey)) return;
+    if (!axs_trollopenfix_gestureTarget) {
+        axs_trollopenfix_gestureTarget = [[AxsTrollOpenFixGestureTarget alloc] init];
+    }
     UIView *view = win;
-    if (!view.window) return NO;
-    CGFloat screenW = view.window.bounds.size.width;
-    CGFloat viewW = CGRectGetWidth(view.frame);
-    if (screenW <= 0 || viewW <= 0) return NO;
-    return viewW < screenW * 0.40;
+    for (NSDictionary *cfg in @[
+        @{ @"dir": @(UISwipeGestureRecognizerDirectionUp) },
+        @{ @"dir": @(UISwipeGestureRecognizerDirectionDown) },
+        @{ @"dir": @(UISwipeGestureRecognizerDirectionLeft) },
+        @{ @"dir": @(UISwipeGestureRecognizerDirectionRight) },
+    ]) {
+        UISwipeGestureRecognizer *gr = [[UISwipeGestureRecognizer alloc]
+            initWithTarget:axs_trollopenfix_gestureTarget
+            action:@selector(handleSwipe:)];
+        gr.direction = [cfg[@"dir"] integerValue];
+        gr.delegate = axs_trollopenfix_gestureTarget;
+        [view addGestureRecognizer:gr];
+    }
+    objc_setAssociatedObject(win, &axs_trollopenfix_gesturesKey, @YES, OBJC_ASSOCIATION_RETAIN);
+    AXS_TROLLOPEN_FIX_LOG(@"mini mode: gestures added, snapped to edge");
 }
+
+// 退出小窗模式时：移除滑动手势
+static void axs_trollopenfix_onExitMiniMode(id win) {
+    UIView *view = win;
+    if (!view) return;
+    NSMutableArray *toRemove = [NSMutableArray array];
+    for (UIGestureRecognizer *gr in [view gestureRecognizers]) {
+        if ([gr isKindOfClass:[UISwipeGestureRecognizer class]]) {
+            [toRemove addObject:gr];
+        }
+    }
+    for (UIGestureRecognizer *gr in toRemove) {
+        [view removeGestureRecognizer:gr];
+    }
+    objc_setAssociatedObject(win, &axs_trollopenfix_gesturesKey, nil, OBJC_ASSOCIATION_RETAIN);
+}
+
+#pragma mark - SpringBoard 路由 hook
+
+static void (*axs_trollopenfix_orig_handleOpenRequest)(void *, void *, void *, void *, void *, void *, void *);
+static void (*axs_trollopenfix_orig_openURLCore)(void *, void *, void *, void *, void *, void *, void *, void *);
+
+static void axs_trollopenfix_new_handleOpenRequest(void *self, void *_cmd, void *request, void *options,
+                                                   void *activationSettings, void *origin, void *withResult) {
+    axs_trollopenfix_orig_handleOpenRequest(self, _cmd, request, options, activationSettings, origin, withResult);
+    @try {
+        if (!axs_trollopenfix_enabled()) return;
+        NSString *source = axs_trollopenfix_extractBundleID((__bridge id)origin);
+        if (!source && options) {
+            SEL orgSel = NSSelectorFromString(@"originator");
+            Class cls = object_getClass((__bridge id)options);
+            if (cls && [(id)cls respondsToSelector:orgSel]) {
+                Method m = class_getInstanceMethod(cls, orgSel);
+                if (m && method_getTypeEncoding(m)[0] == '@') {
+                    id org = ((id(*)(id, SEL))objc_msgSend)((__bridge id)options, orgSel);
+                    source = axs_trollopenfix_extractBundleID(org);
+                }
+            }
+        }
+        if (!source) source = axs_trollopenfix_extractBundleID((__bridge id)options);
+        NSString *target = axs_trollopenfix_extractBundleID((__bridge id)request);
+        if (!target) target = axs_trollopenfix_extractBundleID((__bridge id)activationSettings);
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                NSString *t = target ?: axs_trollopenfix_frontmostIdentifier();
+                axs_trollopenfix_processRoutePair(source, t);
+            } @catch (NSException *e) {}
+        });
+    } @catch (NSException *e) {}
+}
+
+static void axs_trollopenfix_new_openURLCore(void *self, void *_cmd, void *url, void *display, void *animating,
+                                             void *activationSettings, void *origin, void *withResult) {
+    axs_trollopenfix_orig_openURLCore(self, _cmd, url, display, animating, activationSettings, origin, withResult);
+    @try {
+        if (!axs_trollopenfix_enabled()) return;
+        NSString *source = axs_trollopenfix_extractBundleID((__bridge id)origin);
+        NSString *target = axs_trollopenfix_extractBundleID((__bridge id)activationSettings);
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                NSString *t = target ?: axs_trollopenfix_frontmostIdentifier();
+                axs_trollopenfix_processRoutePair(source, t);
+            } @catch (NSException *e) {}
+        });
+    } @catch (NSException *e) {}
+}
+
+static void axs_trollopenfix_hookRouteMethods(void) {
+    Class wsClass = objc_getClass("SBMainWorkspace");
+    if (wsClass) {
+        SEL sel = NSSelectorFromString(@"_handleOpenApplicationRequest:options:activationSettings:origin:withResult:");
+        Method m = class_getInstanceMethod(wsClass, sel);
+        if (m) {
+            IMP imp = method_getImplementation(m);
+            method_setImplementation(m, (IMP)axs_trollopenfix_new_handleOpenRequest);
+            axs_trollopenfix_orig_handleOpenRequest = (void (*)(void *, void *, void *, void *, void *, void *, void *))imp;
+        }
+    }
+    Class sbClass = objc_getClass("SpringBoard");
+    if (sbClass) {
+        SEL sel = NSSelectorFromString(@"_openURLCore:display:animating:activationSettings:origin:withResult:");
+        Method m = class_getInstanceMethod(sbClass, sel);
+        if (m) {
+            IMP imp = method_getImplementation(m);
+            method_setImplementation(m, (IMP)axs_trollopenfix_new_openURLCore);
+            axs_trollopenfix_orig_openURLCore = (void (*)(void *, void *, void *, void *, void *, void *, void *, void *))imp;
+        }
+    }
+}
+
+#pragma mark - 入口
+
+%ctor {
+    @autoreleasepool {
+        [AxsTrollOpenFixConfig axs_trollopenfix_shared];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            axs_trollopenfix_hookFloatingWindowClass();
+            axs_trollopenfix_hookRouteMethods();
+        });
+    }
+}static void (*axs_trollopenfix_orig_setMiniWindowModeEnabled)(id, SEL, BOOL);
 
 static void axs_trollopenfix_new_setMiniWindowModeEnabled(id self, SEL _cmd, BOOL value) {
     axs_trollopenfix_orig_setMiniWindowModeEnabled(self, _cmd, value);
-    if (value && axs_trollopenfix_enabled()) {
-        axs_trollopenfix_scheduleMiniSnap(self);
-    }
-}
-
-static void axs_trollopenfix_new_setCenter(id self, SEL _cmd, CGPoint center) {
-    axs_trollopenfix_orig_setCenter(self, _cmd, center);
-    if (axs_trollopenfix_enabled() && axs_trollopenfix_miniModeEnabled(self)) {
-        // 记录拖动起点（第一次 setCenter 时）
-        NSValue *start = objc_getAssociatedObject(self, &axs_trollopenfix_dragStartKey);
-        if (!start) {
-            objc_setAssociatedObject(self, &axs_trollopenfix_dragStartKey,
-                [NSValue valueWithCGPoint:center], OBJC_ASSOCIATION_RETAIN);
-        }
-        axs_trollopenfix_scheduleMiniSnap(self);
-    }
-}
-
-static void axs_trollopenfix_new_setFrame(id self, SEL _cmd, CGRect frame) {
-    axs_trollopenfix_orig_setFrame(self, _cmd, frame);
-    if (axs_trollopenfix_enabled() && axs_trollopenfix_miniModeEnabled(self)) {
-        axs_trollopenfix_scheduleMiniSnap(self);
+    if (!axs_trollopenfix_enabled()) return;
+    if (value) {
+        axs_trollopenfix_onEnterMiniMode(self);
+    } else {
+        axs_trollopenfix_onExitMiniMode(self);
     }
 }
 
@@ -387,30 +446,6 @@ static void axs_trollopenfix_hookFloatingWindowClass(void) {
         axs_trollopenfix_orig_setMiniWindowModeEnabled =
             (void (*)(id, SEL, BOOL))method_getImplementation(miniMethod);
         method_setImplementation(miniMethod, (IMP)axs_trollopenfix_new_setMiniWindowModeEnabled);
-    }
-
-    SEL sel = @selector(setCenter:);
-    Method m = class_getInstanceMethod(cls, sel);
-    const char *types = m ? method_getTypeEncoding(m) : "v32@0:8{CGPoint=dd}16";
-    IMP resolved = class_getMethodImplementation(cls, sel);
-    if (class_addMethod(cls, sel, (IMP)axs_trollopenfix_new_setCenter, types)) {
-        axs_trollopenfix_orig_setCenter = (void (*)(id, SEL, CGPoint))resolved;
-    } else {
-        Method own = class_getInstanceMethod(cls, sel);
-        axs_trollopenfix_orig_setCenter = (void (*)(id, SEL, CGPoint))method_getImplementation(own);
-        method_setImplementation(own, (IMP)axs_trollopenfix_new_setCenter);
-    }
-
-    sel = @selector(setFrame:);
-    m = class_getInstanceMethod(cls, sel);
-    types = m ? method_getTypeEncoding(m) : "v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
-    resolved = class_getMethodImplementation(cls, sel);
-    if (class_addMethod(cls, sel, (IMP)axs_trollopenfix_new_setFrame, types)) {
-        axs_trollopenfix_orig_setFrame = (void (*)(id, SEL, CGRect))resolved;
-    } else {
-        Method own = class_getInstanceMethod(cls, sel);
-        axs_trollopenfix_orig_setFrame = (void (*)(id, SEL, CGRect))method_getImplementation(own);
-        method_setImplementation(own, (IMP)axs_trollopenfix_new_setFrame);
     }
 }
 
