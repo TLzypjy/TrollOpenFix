@@ -737,7 +737,8 @@ static void axs_trollopenfix_hookFloatingWindowSetup(void) {
     @autoreleasepool {
         [AxsTrollOpenFixConfig axs_trollopenfix_shared];
         NSString *pn = [[NSProcessInfo processInfo] processName];
-        AXS_TROLLOPEN_FIX_LOG([NSString stringWithFormat:@"ctor loaded in %@", pn]);
+        NSString *ctorMsg = [NSString stringWithFormat:@"ctor loaded in %@", pn];
+        AXS_TROLLOPEN_FIX_LOG(ctorMsg);
         dispatch_async(dispatch_get_main_queue(), ^{
             axs_trollopenfix_hookFloatingWindowSetup();
             axs_trollopenfix_hookRouteMethods();
