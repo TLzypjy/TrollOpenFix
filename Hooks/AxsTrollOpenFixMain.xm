@@ -13,7 +13,34 @@
 // 3) 小窗手势：上划关闭 / 下划全屏 / 左划贴左 / 右划贴右
 //    （被动 Pan 检测：不拦截触摸、不与 TrollOpen 自身拖动手势冲突）
 
-#define AXS_TROLLOPEN_FIX_LOG(msg) NSLog(@"[TrollOpenFix] %@", (msg))
+// 日志同时写 NSLog 和 /var/mobile/TrollOpenFix.log（方便直接拿文件，不依赖 syslog 工具）
+static void axs_fix_writeLog(NSString *msg) {
+    @try {
+        static NSString *logPath;
+        static NSDateFormatter *logFmt;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            logPath = @"/var/mobile/TrollOpenFix.log";
+            logFmt = [[NSDateFormatter alloc] init];
+            logFmt.dateFormat = @"MM-dd HH:mm:ss.SSS";
+        });
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:logPath error:nil];
+        if (attrs && [attrs fileSize] > 256 * 1024) [fm removeItemAtPath:logPath error:nil];
+        NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
+                          [logFmt stringFromDate:[NSDate date]], msg];
+        const char *s = line.UTF8String;
+        FILE *f = fopen(logPath.UTF8String, "a");
+        if (f) { fwrite(s, 1, strlen(s), f); fclose(f); }
+    } @catch (NSException *e) {}
+}
+
+static void axs_fix_log(NSString *msg) {
+    NSLog(@"[TrollOpenFix] %@", msg);
+    axs_fix_writeLog(msg);
+}
+
+#define AXS_TROLLOPEN_FIX_LOG(msg) axs_fix_log((msg))
 
 static BOOL axs_trollopenfix_enabled(void) {
     return [[AxsTrollOpenFixConfig axs_trollopenfix_shared] axs_trollopenfix_isEnabled];
@@ -505,7 +532,9 @@ static void axs_fix_goFullscreen(id view) {
         AXS_TROLLOPEN_FIX_LOG(msg);
         return;
     }
-    AXS_TROLLOPEN_FIX_LOG(@"drag release -> snap nearest edge");
+    NSString *msg = [NSString stringWithFormat:@"drag release (vx=%.0f vy=%.0f dx=%.0f dy=%.0f) -> snap nearest edge",
+                     vel.x, vel.y, trans.x, trans.y];
+    AXS_TROLLOPEN_FIX_LOG(msg);
     axs_fix_snapNearest(view);
     axs_fix_settleSnap(view, 0);
 }
@@ -707,6 +736,8 @@ static void axs_trollopenfix_hookFloatingWindowSetup(void) {
 %ctor {
     @autoreleasepool {
         [AxsTrollOpenFixConfig axs_trollopenfix_shared];
+        NSString *pn = [[NSProcessInfo processInfo] processName];
+        AXS_TROLLOPEN_FIX_LOG([NSString stringWithFormat:@"ctor loaded in %@", pn]);
         dispatch_async(dispatch_get_main_queue(), ^{
             axs_trollopenfix_hookFloatingWindowSetup();
             axs_trollopenfix_hookRouteMethods();
