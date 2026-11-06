@@ -162,21 +162,6 @@ static void axs_trollopenfix_processRoutePair(NSString *source, NSString *target
     }
 }
 
-static NSString *axs_trollopenfix_frontmostIdentifier(void) {
-    @try {
-        Class sbClass = objc_getClass("SpringBoard");
-        id app = nil;
-        if (sbClass && [(id)sbClass respondsToSelector:@selector(sharedApplication)]) {
-            app = ((id(*)(id, SEL))objc_msgSend)((id)sbClass, @selector(sharedApplication));
-        }
-        if (!app) app = [UIApplication sharedApplication];
-        if (!app) return nil;
-        SEL frontSel = NSSelectorFromString(@"_accessibilityFrontMostApplication");
-        if (![app respondsToSelector:frontSel]) return nil;
-        id front = ((id(*)(id, SEL))objc_msgSend)(app, frontSel);
-        return axs_trollopenfix_extractBundleID(front);
-    } @catch (NSException *e) { return nil; }
-}
 
 static void (*axs_trollopenfix_orig_handleOpenRequest)(void *, void *, void *, void *, void *, void *, void *);
 static void (*axs_trollopenfix_orig_openURLCore)(void *, void *, void *, void *, void *, void *, void *, void *);
