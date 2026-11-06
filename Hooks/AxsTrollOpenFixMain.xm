@@ -473,30 +473,39 @@ static void axs_fix_goFullscreen(id view) {
     if (!axs_trollopenfix_enabled() || !axs_fix_isMini(view) || !axs_fix_isTargetFloatingView(view)) return;
 
     CGPoint vel = [pan velocityInView:(view.superview ?: view)];
+    CGPoint trans = [pan translationInView:(view.superview ?: view)];
     CGFloat avx = fabs(vel.x);
     CGFloat avy = fabs(vel.y);
-    BOOL fast = (avx > 450.0 || avy > 450.0);
-    BOOL horizontal = avx > avy * 1.25;
-    BOOL vertical = avy > avx * 1.25;
+    CGFloat atx = fabs(trans.x);
+    CGFloat aty = fabs(trans.y);
+    // 只有"快甩"才触发手势：速度要快 + 甩动方向上确实移动了足够距离
+    // 慢速拖动（哪怕松手瞬间带一点速度）一律视为拖动 -> 贴最近边
+    const CGFloat FLICK_SPEED = 850.0;
+    const CGFloat FLICK_DIST = 30.0;
+    BOOL fast = (avx > FLICK_SPEED || avy > FLICK_SPEED);
+    BOOL horizontal = fast && avx > avy * 1.4 && atx > aty * 1.2 && atx > FLICK_DIST;
+    BOOL vertical = fast && avy > avx * 1.4 && aty > atx * 1.2 && aty > FLICK_DIST;
 
-    if (fast && vertical) {
+    if (vertical) {
         if (vel.y < 0) {
             BOOL ok = axs_fix_closeWindow(view);
-            NSString *msg = ok ? @"flick up -> close sent" : @"flick up -> close probe failed";
-            AXS_TROLLOPEN_FIX_LOG(msg);
+            NSString *msg = [NSString stringWithFormat:@"flick up (%.0fpt/s) -> close sent", avy];
+            AXS_TROLLOPEN_FIX_LOG(ok ? msg : (@"flick up -> close probe failed"));
         } else {
-            AXS_TROLLOPEN_FIX_LOG(@"flick down -> fullscreen");
+            NSString *msg = [NSString stringWithFormat:@"flick down (%.0fpt/s) -> fullscreen", avy];
+            AXS_TROLLOPEN_FIX_LOG(msg);
             axs_fix_goFullscreen(view);
         }
         return;
     }
-    if (fast && horizontal) {
+    if (horizontal) {
         axs_fix_snapEdge(view, vel.x < 0);
-        NSString *msg = vel.x < 0 ? @"flick left -> snap left" : @"flick right -> snap right";
+        NSString *msg = [NSString stringWithFormat:@"flick %@ (%.0fpt/s) -> snap edge",
+                         vel.x < 0 ? @"left" : @"right", avx];
         AXS_TROLLOPEN_FIX_LOG(msg);
         return;
     }
-    AXS_TROLLOPEN_FIX_LOG(@"release -> snap nearest edge");
+    AXS_TROLLOPEN_FIX_LOG(@"drag release -> snap nearest edge");
     axs_fix_snapNearest(view);
     axs_fix_settleSnap(view, 0);
 }
