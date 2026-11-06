@@ -348,7 +348,14 @@ static void (*axs_trollopenfix_orig_setFrame)(id, SEL, CGRect);
 static BOOL axs_trollopenfix_miniModeEnabled(id win) {
     SEL sel = NSSelectorFromString(@"miniWindowModeEnabled");
     if (![win respondsToSelector:sel]) return NO;
-    return ((BOOL(*)(id, SEL))objc_msgSend)(win, sel);
+    if (!((BOOL(*)(id, SEL))objc_msgSend)(win, sel)) return NO;
+    // 额外检查窗口尺寸：大窗（分屏模式）不启用手势，只有小窗尺寸才触发
+    UIView *view = win;
+    if (!view.window) return NO;
+    CGFloat screenW = view.window.bounds.size.width;
+    CGFloat viewW = CGRectGetWidth(view.frame);
+    if (screenW <= 0 || viewW <= 0) return NO;
+    return viewW < screenW * 0.55;
 }
 
 static void axs_trollopenfix_new_setMiniWindowModeEnabled(id self, SEL _cmd, BOOL value) {
