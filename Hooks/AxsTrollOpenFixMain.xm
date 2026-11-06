@@ -1,13 +1,16 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach-o/dyld.h>
+#import <math.h>
 #import "AxsTrollOpenFixConfig.h"
 #import "AxsTrollOpenFixPrivate.h"
 
 // TrollOpen 伴生修复：仅在 SpringBoard 内运行。
-// 1) 回调关闭：反向路由配对关闭浮窗
-// 2) 小窗贴边：进入小窗立即贴边
-// 3) 小窗手势：上划关闭 / 下划全屏 / 左右划贴边
+// 1) 回调关闭：反向路由配对，从目标应用返回来源时自动关闭浮窗
+// 2) 小窗贴边：进入小窗自动贴边；拖动松手立即贴到最近的左右边缘
+// 3) 小窗手势：上划关闭 / 下划全屏 / 左划贴左 / 右划贴右
+//    （被动 Pan 检测：不拦截触摸、不与 TrollOpen 自身拖动手势冲突）
 
 #define AXS_TROLLOPEN_FIX_LOG(msg) NSLog(@"[TrollOpenFix] %@", (msg))
 
@@ -162,7 +165,6 @@ static void axs_trollopenfix_processRoutePair(NSString *source, NSString *target
     }
 }
 
-
 static void (*axs_trollopenfix_orig_handleOpenRequest)(void *, void *, void *, void *, void *, void *, void *);
 static void (*axs_trollopenfix_orig_openURLCore)(void *, void *, void *, void *, void *, void *, void *, void *);
 
@@ -236,153 +238,414 @@ static void axs_trollopenfix_hookRouteMethods(void) {
     }
 }
 
-static void axs_trollopenfix_snapNearestEdge(id win) {
-    UIView *view = win;
-    CGRect screen = view.window ? view.window.bounds : [UIScreen mainScreen].bounds;
-    if (screen.size.width <= 0) return;
-    CGFloat margin = 8.0;
-    CGFloat w = CGRectGetWidth(view.frame);
-    CGFloat halfH = CGRectGetHeight(view.frame) / 2.0;
-    CGFloat targetX = (view.center.x < CGRectGetMidX(screen))
-        ? CGRectGetMinX(screen) + margin + w / 2.0
-        : CGRectGetMaxX(screen) - margin - w / 2.0;
-    CGFloat targetY = MIN(MAX(view.center.y, CGRectGetMinY(screen) + margin + halfH),
-                          CGRectGetMaxY(screen) - margin - halfH);
-    [UIView animateWithDuration:0.15 delay:0
-        options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
-        animations:^{ view.center = CGPointMake(targetX, targetY); }
-        completion:nil];
+#pragma mark - 小窗：贴边与手势
+
+static const void *AxsFixPanInstalledKey = &AxsFixPanInstalledKey;
+static const void *AxsFixTouchingKey = &AxsFixTouchingKey;
+static const void *AxsFixAutoSnapKey = &AxsFixAutoSnapKey;
+
+static NSMutableDictionary *axs_fix_state;            // panTarget / miniSetterTarget 强引用
+static NSMutableDictionary *axs_fix_mapCenter;        // Class -> 原始 setCenter: IMP
+static NSMutableDictionary *axs_fix_mapFrame;         // Class -> 原始 setFrame: IMP
+static NSMutableDictionary *axs_fix_mapLayout;        // Class -> 原始 layoutSubviews IMP
+static NSMutableDictionary *axs_fix_mapMiniMode;      // Class -> 原始 setMiniWindowModeEnabled: IMP
+static NSMutableSet *axs_fix_setCenterMethods;
+static NSMutableSet *axs_fix_setFrameMethods;
+static NSMutableSet *axs_fix_layoutMethods;
+static NSMutableSet *axs_fix_miniModeMethods;
+static BOOL axs_fix_inOwnSnap = NO;                   // 我们自己的贴边动画触发的 setCenter: 不回环处理
+
+static void axs_fix_initState(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        axs_fix_state = [NSMutableDictionary dictionary];
+        axs_fix_mapCenter = [NSMutableDictionary dictionary];
+        axs_fix_mapFrame = [NSMutableDictionary dictionary];
+        axs_fix_mapLayout = [NSMutableDictionary dictionary];
+        axs_fix_mapMiniMode = [NSMutableDictionary dictionary];
+        axs_fix_setCenterMethods = [NSMutableSet set];
+        axs_fix_setFrameMethods = [NSMutableSet set];
+        axs_fix_layoutMethods = [NSMutableSet set];
+        axs_fix_miniModeMethods = [NSMutableSet set];
+    });
 }
 
-static void axs_trollopenfix_snapToEdge(id win, BOOL left) {
-    UIView *view = win;
-    CGRect screen = view.window ? view.window.bounds : [UIScreen mainScreen].bounds;
-    CGFloat margin = 8.0;
-    CGFloat w = CGRectGetWidth(view.frame);
-    CGFloat halfH = CGRectGetHeight(view.frame) / 2.0;
-    CGFloat targetX = left
-        ? CGRectGetMinX(screen) + margin + w / 2.0
-        : CGRectGetMaxX(screen) - margin - w / 2.0;
-    CGFloat targetY = MIN(MAX(view.center.y, CGRectGetMinY(screen) + margin + halfH),
-                          CGRectGetMaxY(screen) - margin - halfH);
-    [UIView animateWithDuration:0.15 delay:0
-        options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
-        animations:^{ view.center = CGPointMake(targetX, targetY); }
-        completion:nil];
-}
-
-static void axs_trollopenfix_exitMiniMode(id win) {
-    SEL sel = NSSelectorFromString(@"setMiniWindowModeEnabled:");
-    if ([win respondsToSelector:sel]) {
-        ((void(*)(id, SEL, BOOL))objc_msgSend)(win, sel, NO);
+// 类自身是否声明了该方法（不查继承链，避免把钩子挂到 UIView 基类上影响整个 SpringBoard）
+static BOOL axs_fix_classDeclaresMethod(Class cls, SEL sel) {
+    if (!cls || !sel) return NO;
+    unsigned int count = 0;
+    Method *list = class_copyMethodList(cls, &count);
+    BOOL found = NO;
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(list[i]) == sel) { found = YES; break; }
     }
+    free(list);
+    return found;
 }
 
-static void axs_trollopenfix_closeFloatingWin(id win) {
-    for (NSString *name in @[@"closeWindowWithoutTerminatingProcessImmediately",
-                             @"TOJBMETHOD256", @"TOJBMETHOD254"]) {
+// 浮窗本体特征：带 bundleID / 小窗模式属性 / 关闭方法之一（排除浮窗内部子视图）
+static BOOL axs_fix_isFloatingLike(id obj) {
+    if (!obj) return NO;
+    return ([obj respondsToSelector:NSSelectorFromString(@"miniWindowModeEnabled")]
+         || [obj respondsToSelector:NSSelectorFromString(@"bundleID")]
+         || [obj respondsToSelector:NSSelectorFromString(@"closeWindowWithoutTerminatingProcessImmediately")]);
+}
+
+// 浮窗挂载点判定：父视图不能是 TrollOpen 自己的容器视图（排除浮窗内的按钮/标签等）
+static BOOL axs_fix_isTargetFloatingView(UIView *view) {
+    if (!axs_fix_isFloatingLike(view)) return NO;
+    if (!view.superview) return YES; // 自身就是 window
+    return ![NSStringFromClass([view.superview class]) hasPrefix:@"TOJB"];
+}
+
+static BOOL axs_fix_isMini(UIView *view) {
+    if (!view || CGRectGetWidth(view.bounds) <= 0) return NO;
+    CGFloat sw = CGRectGetWidth(view.window ? view.window.bounds : [UIScreen mainScreen].bounds);
+    if (sw <= 0) return NO;
+    return CGRectGetWidth(view.bounds) < sw * 0.6;
+}
+
+static CGRect axs_fix_screenRect(UIView *view) {
+    if (view.superview && view.window)
+        return [view.superview convertRect:view.window.bounds fromView:nil];
+    if (view.window) return view.window.bounds;
+    return [UIScreen mainScreen].bounds;
+}
+
+static void axs_fix_snapEdge(UIView *view, BOOL left) {
+    if (!view || !view.window) return;
+    CGRect screen = axs_fix_screenRect(view);
+    CGFloat margin = 8.0;
+    CGFloat w = CGRectGetWidth(view.frame);
+    CGFloat halfH = CGRectGetHeight(view.frame) / 2.0;
+    if (w <= 0 || halfH <= 0) return;
+    CGFloat tx = left ? CGRectGetMinX(screen) + margin + w / 2.0
+                      : CGRectGetMaxX(screen) - margin - w / 2.0;
+    CGFloat ty = MIN(MAX(view.center.y, CGRectGetMinY(screen) + margin + halfH),
+                     CGRectGetMaxY(screen) - margin - halfH);
+    axs_fix_inOwnSnap = YES;
+    [UIView animateWithDuration:0.12 delay:0
+        options:(UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
+                 | UIViewAnimationOptionBeginFromCurrentState)
+        animations:^{ view.center = CGPointMake(tx, ty); }
+        completion:nil];
+    axs_fix_inOwnSnap = NO;
+}
+
+static void axs_fix_snapNearest(UIView *view) {
+    if (!view || !view.window) return;
+    axs_fix_snapEdge(view, view.center.x < CGRectGetMidX(axs_fix_screenRect(view)));
+}
+
+// 松手后巩固贴边：TrollOpen 可能在我们贴边后又有自己的回弹动画，短周期重贴直到稳定
+static void axs_fix_settleSnap(UIView *view, NSInteger attempt) {
+    if (!view || attempt >= 6) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!axs_trollopenfix_enabled() || !view.window) return;
+        NSNumber *touching = objc_getAssociatedObject(view, AxsFixTouchingKey);
+        if (touching.boolValue) return; // 用户又抓住了
+        CGRect screen = axs_fix_screenRect(view);
+        BOOL left = view.center.x < CGRectGetMidX(screen);
+        CGFloat w = CGRectGetWidth(view.frame);
+        CGFloat targetX = left ? CGRectGetMinX(screen) + 8.0 + w / 2.0
+                               : CGRectGetMaxX(screen) - 8.0 - w / 2.0;
+        if (fabs(view.center.x - targetX) > 1.5) {
+            axs_fix_snapEdge(view, left);
+            axs_fix_settleSnap(view, attempt + 1);
+        }
+    });
+}
+
+static BOOL axs_fix_closeWindow(id primary) {
+    if (axs_trollopenfix_closeFloatingWindow(primary)) return YES;
+    id target = axs_fix_state[@"miniSetterTarget"];
+    if (target && target != primary && axs_trollopenfix_closeFloatingWindow(target)) return YES;
+    return NO;
+}
+
+static void axs_fix_goFullscreen(id view) {
+    SEL setMini = NSSelectorFromString(@"setMiniWindowModeEnabled:");
+    if ([view respondsToSelector:setMini]) {
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(view, setMini, NO);
+        return;
+    }
+    id target = axs_fix_state[@"miniSetterTarget"];
+    if (target && [target respondsToSelector:setMini]) {
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(target, setMini, NO);
+        return;
+    }
+    for (NSString *name in @[@"fullscreenCurrentFloatingWindow", @"performMultiScreenSwapToFullscreen"]) {
         SEL sel = NSSelectorFromString(name);
-        if ([win respondsToSelector:sel]) {
-            ((void(*)(id, SEL))objc_msgSend)(win, sel);
+        if ([view respondsToSelector:sel]) {
+            ((void(*)(id, SEL))objc_msgSend)(view, sel);
+            return;
+        }
+        if (target && [target respondsToSelector:sel]) {
+            ((void(*)(id, SEL))objc_msgSend)(target, sel);
             return;
         }
     }
+    AXS_TROLLOPEN_FIX_LOG(@"fullscreen: no known action available");
 }
 
-@interface AxsTrollOpenFixGestureTarget : NSObject <UIGestureRecognizerDelegate>
+#pragma mark - 被动 Pan 手势（上划关闭 / 下划全屏 / 左右贴边 / 松手贴边）
+
+@interface AxsTrollOpenFixPanTarget : NSObject <UIGestureRecognizerDelegate>
 @end
-@implementation AxsTrollOpenFixGestureTarget
-- (void)handleSwipe:(UISwipeGestureRecognizer *)gr {
-    if (!axs_trollopenfix_enabled()) return;
+
+@implementation AxsTrollOpenFixPanTarget
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gr {
     UIView *view = gr.view;
-    if (!view) return;
-    switch (gr.direction) {
-        case UISwipeGestureRecognizerDirectionUp:
-            AXS_TROLLOPEN_FIX_LOG(@"swipe up -> close");
-            axs_trollopenfix_closeFloatingWin(view);
-            break;
-        case UISwipeGestureRecognizerDirectionDown:
-            AXS_TROLLOPEN_FIX_LOG(@"swipe down -> fullscreen");
-            axs_trollopenfix_exitMiniMode(view);
-            break;
-        case UISwipeGestureRecognizerDirectionLeft:
-            AXS_TROLLOPEN_FIX_LOG(@"swipe left -> snap left");
-            axs_trollopenfix_snapToEdge(view, YES);
-            break;
-        case UISwipeGestureRecognizerDirectionRight:
-            AXS_TROLLOPEN_FIX_LOG(@"swipe right -> snap right");
-            axs_trollopenfix_snapToEdge(view, NO);
-            break;
-    }
+    if (!view) return NO;
+    return axs_trollopenfix_enabled() && axs_fix_isMini(view) && axs_fix_isTargetFloatingView(view);
 }
+
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gr
     shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
-    return NO;
+    return YES; // 与 TrollOpen 自身拖动手势并行，互不干扰
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)pan {
+    UIView *view = pan.view;
+    if (!view) return;
+    UIGestureRecognizerState st = pan.state;
+    if (st == UIGestureRecognizerStateEnded || st == UIGestureRecognizerStateCancelled
+        || st == UIGestureRecognizerStateFailed) {
+        objc_setAssociatedObject(view, AxsFixTouchingKey, @NO, OBJC_ASSOCIATION_RETAIN);
+    } else {
+        objc_setAssociatedObject(view, AxsFixTouchingKey, @YES, OBJC_ASSOCIATION_RETAIN);
+    }
+    if (st != UIGestureRecognizerStateEnded) return;
+    if (!axs_trollopenfix_enabled() || !axs_fix_isMini(view) || !axs_fix_isTargetFloatingView(view)) return;
+
+    CGPoint vel = [pan velocityInView:(view.superview ?: view)];
+    CGFloat avx = fabs(vel.x);
+    CGFloat avy = fabs(vel.y);
+    BOOL fast = (avx > 450.0 || avy > 450.0);
+    BOOL horizontal = avx > avy * 1.25;
+    BOOL vertical = avy > avx * 1.25;
+
+    if (fast && vertical) {
+        if (vel.y < 0) {
+            BOOL ok = axs_fix_closeWindow(view);
+            NSString *msg = ok ? @"flick up -> close sent" : @"flick up -> close probe failed";
+            AXS_TROLLOPEN_FIX_LOG(msg);
+        } else {
+            AXS_TROLLOPEN_FIX_LOG(@"flick down -> fullscreen");
+            axs_fix_goFullscreen(view);
+        }
+        return;
+    }
+    if (fast && horizontal) {
+        axs_fix_snapEdge(view, vel.x < 0);
+        NSString *msg = vel.x < 0 ? @"flick left -> snap left" : @"flick right -> snap right";
+        AXS_TROLLOPEN_FIX_LOG(msg);
+        return;
+    }
+    AXS_TROLLOPEN_FIX_LOG(@"release -> snap nearest edge");
+    axs_fix_snapNearest(view);
+    axs_fix_settleSnap(view, 0);
 }
 @end
 
-static AxsTrollOpenFixGestureTarget *axs_trollopenfix_gestureTarget;
-
-static void axs_trollopenfix_onEnterMiniMode(id win) {
-    axs_trollopenfix_snapNearestEdge(win);
-    UIView *view = win;
-    for (UIGestureRecognizer *gr in [view gestureRecognizers]) {
-        if ([gr isKindOfClass:[UISwipeGestureRecognizer class]]) return;
+static void axs_fix_installPan(UIView *view) {
+    if (!view || [objc_getAssociatedObject(view, AxsFixPanInstalledKey) boolValue]) return;
+    objc_setAssociatedObject(view, AxsFixPanInstalledKey, @YES, OBJC_ASSOCIATION_RETAIN);
+    AxsTrollOpenFixPanTarget *target = axs_fix_state[@"panTarget"];
+    if (!target) {
+        target = [[AxsTrollOpenFixPanTarget alloc] init];
+        axs_fix_state[@"panTarget"] = target;
     }
-    if (!axs_trollopenfix_gestureTarget) {
-        axs_trollopenfix_gestureTarget = [[AxsTrollOpenFixGestureTarget alloc] init];
-    }
-    for (NSNumber *dirNum in @[@(UISwipeGestureRecognizerDirectionUp),
-                               @(UISwipeGestureRecognizerDirectionDown),
-                               @(UISwipeGestureRecognizerDirectionLeft),
-                               @(UISwipeGestureRecognizerDirectionRight)]) {
-        UISwipeGestureRecognizer *gr = [[UISwipeGestureRecognizer alloc]
-            initWithTarget:axs_trollopenfix_gestureTarget action:@selector(handleSwipe:)];
-        gr.direction = dirNum.unsignedIntegerValue;
-        gr.delegate = axs_trollopenfix_gestureTarget;
-        [view addGestureRecognizer:gr];
-    }
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:target
+                                                                          action:@selector(handlePan:)];
+    pan.cancelsTouchesInView = NO;
+    pan.delaysTouchesBegan = NO;
+    pan.delaysTouchesEnded = NO;
+    pan.maximumNumberOfTouches = 1;
+    pan.delegate = target;
+    [view addGestureRecognizer:pan];
+    AXS_TROLLOPEN_FIX_LOG(@"passive pan installed on floating window");
 }
 
-static void axs_trollopenfix_onExitMiniMode(id win) {
-    UIView *view = win;
-    if (!view) return;
-    NSMutableArray *toRemove = [NSMutableArray array];
-    for (UIGestureRecognizer *gr in [view gestureRecognizers]) {
-        if ([gr isKindOfClass:[UISwipeGestureRecognizer class]]) [toRemove addObject:gr];
-    }
-    for (UIGestureRecognizer *gr in toRemove) [view removeGestureRecognizer:gr];
+// 每次浮窗布局/位移后的入口：装 Pan、进入小窗时自动贴边（仅一次）
+static void axs_fix_afterLayout(id self) {
+    if (!axs_trollopenfix_enabled()) return;
+    if (![self isKindOfClass:[UIView class]]) return;
+    UIView *view = (UIView *)self;
+    if (!axs_fix_isTargetFloatingView(view)) return;
+    axs_fix_installPan(view);
+    if (!axs_fix_isMini(view)) return;
+    if ([objc_getAssociatedObject(view, AxsFixTouchingKey) boolValue]) return;
+    if ([objc_getAssociatedObject(view, AxsFixAutoSnapKey) boolValue]) return;
+    objc_setAssociatedObject(view, AxsFixAutoSnapKey, @YES, OBJC_ASSOCIATION_RETAIN);
+    AXS_TROLLOPEN_FIX_LOG(@"mini window detected -> auto snap");
+    axs_fix_settleSnap(view, 0);
 }
 
-static void (*axs_trollopenfix_orig_setMiniWindowModeEnabled)(id, SEL, BOOL);
+#pragma mark - 钩子
 
-static void axs_trollopenfix_new_setMiniWindowModeEnabled(id self, SEL _cmd, BOOL value) {
-    axs_trollopenfix_orig_setMiniWindowModeEnabled(self, _cmd, value);
+static IMP axs_fix_lookupOrig(id self, NSMutableDictionary *map) {
+    Class c = object_getClass(self);
+    while (c) {
+        NSValue *v = map[[NSValue valueWithNonretainedObject:(id)c]];
+        if (v) return (IMP)v.pointerValue;
+        c = class_getSuperclass(c);
+    }
+    return NULL;
+}
+
+static void axs_fix_new_setCenter(id self, SEL _cmd, CGPoint center) {
+    IMP orig = axs_fix_lookupOrig(self, axs_fix_mapCenter);
+    if (orig) ((void(*)(id, SEL, CGPoint))orig)(self, _cmd, center);
+    if (axs_fix_inOwnSnap) return;
+    axs_fix_afterLayout(self);
+}
+
+static void axs_fix_new_setFrame(id self, SEL _cmd, CGRect frame) {
+    IMP orig = axs_fix_lookupOrig(self, axs_fix_mapFrame);
+    if (orig) ((void(*)(id, SEL, CGRect))orig)(self, _cmd, frame);
+    if (axs_fix_inOwnSnap) return;
+    axs_fix_afterLayout(self);
+}
+
+static void axs_fix_new_layoutSubviews(id self, SEL _cmd) {
+    IMP orig = axs_fix_lookupOrig(self, axs_fix_mapLayout);
+    if (orig) ((void(*)(id, SEL))orig)(self, _cmd);
+    if (axs_fix_inOwnSnap) return;
+    axs_fix_afterLayout(self);
+}
+
+static void axs_fix_new_setMiniWindowModeEnabled(id self, SEL _cmd, BOOL value) {
+    IMP orig = axs_fix_lookupOrig(self, axs_fix_mapMiniMode);
+    if (orig) ((void(*)(id, SEL, BOOL))orig)(self, _cmd, value);
     if (!axs_trollopenfix_enabled()) return;
     if (value) {
-        axs_trollopenfix_onEnterMiniMode(self);
+        axs_fix_state[@"miniSetterTarget"] = self;
+        objc_setAssociatedObject(self, AxsFixAutoSnapKey, @NO, OBJC_ASSOCIATION_RETAIN);
+        AXS_TROLLOPEN_FIX_LOG(@"mini mode ON via setter");
+        axs_fix_afterLayout(self);
     } else {
-        axs_trollopenfix_onExitMiniMode(self);
+        objc_setAssociatedObject(self, AxsFixAutoSnapKey, @YES, OBJC_ASSOCIATION_RETAIN);
+        AXS_TROLLOPEN_FIX_LOG(@"mini mode OFF via setter");
     }
 }
 
-static void axs_trollopenfix_hookFloatingWindowClass(void) {
-    Class cls = axs_trollopenfix_floatingWindowClass();
-    if (!cls) return;
-    SEL miniSel = NSSelectorFromString(@"setMiniWindowModeEnabled:");
-    Method m = class_getInstanceMethod(cls, miniSel);
-    if (m) {
-        axs_trollopenfix_orig_setMiniWindowModeEnabled =
-            (void (*)(id, SEL, BOOL))method_getImplementation(m);
-        method_setImplementation(m, (IMP)axs_trollopenfix_new_setMiniWindowModeEnabled);
+static void axs_fix_hookSelector(Class cls, SEL sel, IMP newImp, NSMutableDictionary *map,
+                                NSMutableSet *hooked, NSString *label) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        NSString *msg = [NSString stringWithFormat:@"%@: %@ missing", label, NSStringFromSelector(sel)];
+        AXS_TROLLOPEN_FIX_LOG(msg);
+        return;
     }
+    NSValue *mk = [NSValue valueWithPointer:m];
+    if ([hooked containsObject:mk]) return; // 与其他类共享同一个 Method（继承），已挂过
+    [hooked addObject:mk];
+    IMP orig = method_getImplementation(m);
+    method_setImplementation(m, newImp);
+    map[[NSValue valueWithNonretainedObject:(id)cls]] = [NSValue valueWithPointer:orig];
+    NSString *msg = [NSString stringWithFormat:@"hooked %@ on %@", NSStringFromSelector(sel), label];
+    AXS_TROLLOPEN_FIX_LOG(msg);
+}
+
+// 对浮窗类（及其 TOJB 祖先链）挂钩点：只挂"类自己声明"的方法
+static void axs_fix_hookOneClass(Class cls) {
+    if (!cls) return;
+    NSString *label = NSStringFromClass(cls);
+    SEL miniSel = NSSelectorFromString(@"setMiniWindowModeEnabled:");
+    if (axs_fix_classDeclaresMethod(cls, miniSel))
+        axs_fix_hookSelector(cls, miniSel, (IMP)axs_fix_new_setMiniWindowModeEnabled,
+                             axs_fix_mapMiniMode, axs_fix_miniModeMethods, label);
+    if (axs_fix_classDeclaresMethod(cls, @selector(layoutSubviews)))
+        axs_fix_hookSelector(cls, @selector(layoutSubviews), (IMP)axs_fix_new_layoutSubviews,
+                             axs_fix_mapLayout, axs_fix_layoutMethods, label);
+    if (axs_fix_classDeclaresMethod(cls, @selector(setCenter:)))
+        axs_fix_hookSelector(cls, @selector(setCenter:), (IMP)axs_fix_new_setCenter,
+                             axs_fix_mapCenter, axs_fix_setCenterMethods, label);
+    if (axs_fix_classDeclaresMethod(cls, @selector(setFrame:)))
+        axs_fix_hookSelector(cls, @selector(setFrame:), (IMP)axs_fix_new_setFrame,
+                             axs_fix_mapFrame, axs_fix_setFrameMethods, label);
+}
+
+// 枚举 TrollOpenJB 镜像里的类：
+// 第一遍找 setMiniWindowModeEnabled: 的真实声明类；
+// 第二遍找声明了 layoutSubviews 且带浮窗特征的 TOJB 视图类（兜底，保证一定能拿到浮窗实例）
+static void axs_fix_discoverMiniModeClasses(void) {
+    const char *imgPath = NULL;
+    NSUInteger n = _dyld_image_count();
+    for (NSUInteger i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && strstr(nm, "TrollOpenJB.dylib")) { imgPath = nm; break; }
+    }
+    if (!imgPath) {
+        AXS_TROLLOPEN_FIX_LOG(@"TrollOpenJB image not found for discovery");
+        return;
+    }
+    unsigned int cnt = 0;
+    const char **names = objc_copyClassNamesForImage(imgPath, &cnt);
+    if (!names) return;
+    int ownerCount = 0;
+    int viewHookCount = 0;
+    SEL setterSel = NSSelectorFromString(@"setMiniWindowModeEnabled:");
+    SEL layoutSel = @selector(layoutSubviews);
+    for (unsigned int i = 0; i < cnt; i++) {
+        Class c = objc_getClass(names[i]);
+        if (!c) continue;
+        if (axs_fix_classDeclaresMethod(c, setterSel)) {
+            BOOL isView = NO;
+            for (Class s = c; s; s = class_getSuperclass(s)) {
+                if (s == [UIView class]) { isView = YES; break; }
+            }
+            NSString *label = NSStringFromClass(c);
+            if (!isView) label = [label stringByAppendingString:@" (non-view)"];
+            NSString *msg = [NSString stringWithFormat:@"mini-mode setter owner: %@", label];
+            AXS_TROLLOPEN_FIX_LOG(msg);
+            axs_fix_hookOneClass(c);
+            ownerCount++;
+        }
+        // 第二遍：TOJB 视图类声明了 layoutSubviews 且类自身声明了浮窗特征方法（严格匹配，避免误伤内部子视图类）
+        if (axs_fix_classDeclaresMethod(c, layoutSel)
+            && (axs_fix_classDeclaresMethod(c, NSSelectorFromString(@"miniWindowModeEnabled"))
+                || axs_fix_classDeclaresMethod(c, NSSelectorFromString(@"bundleID"))
+                || axs_fix_classDeclaresMethod(c, NSSelectorFromString(@"closeWindowWithoutTerminatingProcessImmediately")))) {
+            axs_fix_hookOneClass(c);
+            viewHookCount++;
+        }
+    }
+    free(names);
+    NSString *msg = [NSString stringWithFormat:@"discovery done: setter owners=%d layout candidates=%d",
+                     ownerCount, viewHookCount];
+    AXS_TROLLOPEN_FIX_LOG(msg);
+}
+
+static void axs_trollopenfix_hookFloatingWindowSetup(void) {
+    axs_fix_initState();
+    Class base = axs_trollopenfix_floatingWindowClass();
+    if (base) {
+        AXS_TROLLOPEN_FIX_LOG(@"TOJBClass012 found");
+        axs_fix_hookOneClass(base);
+        // 祖先链上的 TOJB 类也可能声明 layoutSubviews / setCenter:
+        Class s = class_getSuperclass(base);
+        int depth = 0;
+        while (s && depth < 10) {
+            NSString *nm = NSStringFromClass(s);
+            if (![nm hasPrefix:@"TOJB"]) break;
+            axs_fix_hookOneClass(s);
+            s = class_getSuperclass(s);
+            depth++;
+        }
+    } else {
+        AXS_TROLLOPEN_FIX_LOG(@"TOJBClass012 NOT found");
+    }
+    axs_fix_discoverMiniModeClasses();
 }
 
 %ctor {
     @autoreleasepool {
         [AxsTrollOpenFixConfig axs_trollopenfix_shared];
         dispatch_async(dispatch_get_main_queue(), ^{
-            axs_trollopenfix_hookFloatingWindowClass();
+            axs_trollopenfix_hookFloatingWindowSetup();
             axs_trollopenfix_hookRouteMethods();
         });
     }
