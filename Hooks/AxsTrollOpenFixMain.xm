@@ -10,37 +10,8 @@
 // TrollOpen 伴生修复：仅在 SpringBoard 内运行。
 // 1) 回调关闭：反向路由配对，从目标应用返回来源时自动关闭浮窗
 // 2) 小窗贴边：进入小窗自动贴边；拖动松手立即贴到最近的左右边缘
-// 3) 小窗手势：上划关闭 / 下划全屏 / 左划贴左 / 右划贴右
-//    （被动 Pan 检测：不拦截触摸、不与 TrollOpen 自身拖动手势冲突）
-
-// 日志同时写 NSLog 和 /var/mobile/TrollOpenFix.log（方便直接拿文件，不依赖 syslog 工具）
-static void axs_fix_writeLog(NSString *msg) {
-    @try {
-        static NSString *logPath;
-        static NSDateFormatter *logFmt;
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            logPath = @"/var/mobile/TrollOpenFix.log";
-            logFmt = [[NSDateFormatter alloc] init];
-            logFmt.dateFormat = @"MM-dd HH:mm:ss.SSS";
-        });
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSDictionary *attrs = [fm attributesOfItemAtPath:logPath error:nil];
-        if (attrs && [attrs fileSize] > 256 * 1024) [fm removeItemAtPath:logPath error:nil];
-        NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
-                          [logFmt stringFromDate:[NSDate date]], msg];
-        const char *s = line.UTF8String;
-        FILE *f = fopen(logPath.UTF8String, "a");
-        if (f) { fwrite(s, 1, strlen(s), f); fclose(f); }
-    } @catch (NSException *e) {}
-}
-
-static void axs_fix_log(NSString *msg) {
-    NSLog(@"[TrollOpenFix] %@", msg);
-    axs_fix_writeLog(msg);
-}
-
-#define AXS_TROLLOPEN_FIX_LOG(msg) axs_fix_log((msg))
+// 3) 小窗手势：上划关闭 / 下划全屏 / 左划贴左 / 右划贴右（被动 Pan，不影响原生拖动）
+// 性能：无任何日志输出；每实例只做一次浮窗身份校验；Pan 状态转换时才写关联对象
 
 static BOOL axs_trollopenfix_enabled(void) {
     return [[AxsTrollOpenFixConfig axs_trollopenfix_shared] axs_trollopenfix_isEnabled];
@@ -271,6 +242,7 @@ static void axs_trollopenfix_hookRouteMethods(void) {
 static const void *AxsFixPanInstalledKey = &AxsFixPanInstalledKey;
 static const void *AxsFixTouchingKey = &AxsFixTouchingKey;
 static const void *AxsFixAutoSnapKey = &AxsFixAutoSnapKey;
+static const void *AxsFixVerifiedKey = &AxsFixVerifiedKey;
 
 static NSMutableDictionary *axs_fix_state;            // panTarget / miniSetterTarget 强引用
 static NSMutableDictionary *axs_fix_mapCenter;        // Class -> 原始 setCenter: IMP
@@ -404,12 +376,10 @@ static void axs_fix_goFullscreen(id view) {
     SEL swapSel = NSSelectorFromString(@"performMultiScreenSwapToFullscreen");
     if ([view respondsToSelector:swapSel]) {
         ((void(*)(id, SEL))objc_msgSend)(view, swapSel);
-        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via performMultiScreenSwapToFullscreen");
         return;
     }
     if (target && [target respondsToSelector:swapSel]) {
         ((void(*)(id, SEL))objc_msgSend)(target, swapSel);
-        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via performMultiScreenSwapToFullscreen (target)");
         return;
     }
 
@@ -424,7 +394,6 @@ static void axs_fix_goFullscreen(id view) {
             gr = ((id(*)(id, SEL))objc_msgSend)(view, grSel);
         }
         ((void(*)(id, SEL, id))objc_msgSend)(view, tapSel, gr);
-        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via handleTapGesture:");
         return;
     }
 
@@ -432,12 +401,10 @@ static void axs_fix_goFullscreen(id view) {
     SEL cSel = NSSelectorFromString(@"performMultiScreenSwapToFullscreenWithCompletion:");
     if ([view respondsToSelector:cSel]) {
         ((void(*)(id, SEL, void *))objc_msgSend)(view, cSel, NULL);
-        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via performMultiScreenSwapToFullscreenWithCompletion:");
         return;
     }
     if (target && [target respondsToSelector:cSel]) {
         ((void(*)(id, SEL, void *))objc_msgSend)(target, cSel, NULL);
-        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via performMultiScreenSwapToFullscreenWithCompletion: (target)");
         return;
     }
 
@@ -449,7 +416,6 @@ static void axs_fix_goFullscreen(id view) {
         id btn = ((id(*)(id, SEL))objc_msgSend)(view, btnSel);
         if ([btn isKindOfClass:[UIButton class]]) {
             [btn sendActionsForControlEvents:UIControlEventTouchUpInside];
-            AXS_TROLLOPEN_FIX_LOG(@"fullscreen via fullscreenButton tap");
             return;
         }
     }
@@ -458,15 +424,12 @@ static void axs_fix_goFullscreen(id view) {
     SEL fcfSel = NSSelectorFromString(@"fullscreenCurrentFloatingWindow");
     if ([view respondsToSelector:fcfSel]) {
         ((void(*)(id, SEL))objc_msgSend)(view, fcfSel);
-        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via fullscreenCurrentFloatingWindow");
         return;
     }
     if (target && [target respondsToSelector:fcfSel]) {
         ((void(*)(id, SEL))objc_msgSend)(target, fcfSel);
-        AXS_TROLLOPEN_FIX_LOG(@"fullscreen via fullscreenCurrentFloatingWindow (target)");
         return;
     }
-    AXS_TROLLOPEN_FIX_LOG(@"fullscreen: no known action available");
 }
 
 #pragma mark - 被动 Pan 手势（上划关闭 / 下划全屏 / 左右贴边 / 松手贴边）
@@ -490,13 +453,18 @@ static void axs_fix_goFullscreen(id view) {
     UIView *view = pan.view;
     if (!view) return;
     UIGestureRecognizerState st = pan.state;
-    if (st == UIGestureRecognizerStateEnded || st == UIGestureRecognizerStateCancelled
-        || st == UIGestureRecognizerStateFailed) {
-        objc_setAssociatedObject(view, AxsFixTouchingKey, @NO, OBJC_ASSOCIATION_RETAIN);
-    } else {
+    // 只在状态转换时写关联对象，拖动过程中的每一帧不做任何内存操作
+    if (st == UIGestureRecognizerStateBegan) {
         objc_setAssociatedObject(view, AxsFixTouchingKey, @YES, OBJC_ASSOCIATION_RETAIN);
+        return;
     }
-    if (st != UIGestureRecognizerStateEnded) return;
+    if (st != UIGestureRecognizerStateEnded) {
+        if (st == UIGestureRecognizerStateCancelled || st == UIGestureRecognizerStateFailed) {
+            objc_setAssociatedObject(view, AxsFixTouchingKey, @NO, OBJC_ASSOCIATION_RETAIN);
+        }
+        return;
+    }
+    objc_setAssociatedObject(view, AxsFixTouchingKey, @NO, OBJC_ASSOCIATION_RETAIN);
     if (!axs_trollopenfix_enabled() || !axs_fix_isMini(view) || !axs_fix_isTargetFloatingView(view)) return;
 
     CGPoint vel = [pan velocityInView:(view.superview ?: view)];
@@ -515,26 +483,16 @@ static void axs_fix_goFullscreen(id view) {
 
     if (vertical) {
         if (vel.y < 0) {
-            BOOL ok = axs_fix_closeWindow(view);
-            NSString *msg = [NSString stringWithFormat:@"flick up (%.0fpt/s) -> close sent", avy];
-            AXS_TROLLOPEN_FIX_LOG(ok ? msg : (@"flick up -> close probe failed"));
+            axs_fix_closeWindow(view);
         } else {
-            NSString *msg = [NSString stringWithFormat:@"flick down (%.0fpt/s) -> fullscreen", avy];
-            AXS_TROLLOPEN_FIX_LOG(msg);
             axs_fix_goFullscreen(view);
         }
         return;
     }
     if (horizontal) {
         axs_fix_snapEdge(view, vel.x < 0);
-        NSString *msg = [NSString stringWithFormat:@"flick %@ (%.0fpt/s) -> snap edge",
-                         vel.x < 0 ? @"left" : @"right", avx];
-        AXS_TROLLOPEN_FIX_LOG(msg);
         return;
     }
-    NSString *msg = [NSString stringWithFormat:@"drag release (vx=%.0f vy=%.0f dx=%.0f dy=%.0f) -> snap nearest edge",
-                     vel.x, vel.y, trans.x, trans.y];
-    AXS_TROLLOPEN_FIX_LOG(msg);
     axs_fix_snapNearest(view);
     axs_fix_settleSnap(view, 0);
 }
@@ -556,22 +514,24 @@ static void axs_fix_installPan(UIView *view) {
     pan.maximumNumberOfTouches = 1;
     pan.delegate = target;
     [view addGestureRecognizer:pan];
-    AXS_TROLLOPEN_FIX_LOG(@"passive pan installed on floating window");
 }
 
 // 每次浮窗布局/位移后的入口：装 Pan、进入小窗时自动贴边（仅一次）
+// 热路径：未校验的实例只走一次完整校验并缓存结果，之后每次布局只需 3 次关联对象读取
 static void axs_fix_afterLayout(id self) {
     if (!axs_trollopenfix_enabled()) return;
     if (CFAbsoluteTimeGetCurrent() < axs_fix_transitionUntil) return; // 全屏过渡期间不插手
-    if (![self isKindOfClass:[UIView class]]) return;
     UIView *view = (UIView *)self;
-    if (!axs_fix_isTargetFloatingView(view)) return;
-    axs_fix_installPan(view);
+    if (![objc_getAssociatedObject(view, AxsFixVerifiedKey) boolValue]) {
+        if (![self isKindOfClass:[UIView class]]) return;
+        if (!axs_fix_isTargetFloatingView(view)) return;
+        objc_setAssociatedObject(view, AxsFixVerifiedKey, @YES, OBJC_ASSOCIATION_RETAIN);
+    }
+    if (![objc_getAssociatedObject(view, AxsFixPanInstalledKey) boolValue]) axs_fix_installPan(view);
     if (!axs_fix_isMini(view)) return;
     if ([objc_getAssociatedObject(view, AxsFixTouchingKey) boolValue]) return;
     if ([objc_getAssociatedObject(view, AxsFixAutoSnapKey) boolValue]) return;
     objc_setAssociatedObject(view, AxsFixAutoSnapKey, @YES, OBJC_ASSOCIATION_RETAIN);
-    AXS_TROLLOPEN_FIX_LOG(@"mini window detected -> auto snap");
     axs_fix_settleSnap(view, 0);
 }
 
@@ -615,49 +575,40 @@ static void axs_fix_new_setMiniWindowModeEnabled(id self, SEL _cmd, BOOL value) 
     if (value) {
         axs_fix_state[@"miniSetterTarget"] = self;
         objc_setAssociatedObject(self, AxsFixAutoSnapKey, @NO, OBJC_ASSOCIATION_RETAIN);
-        AXS_TROLLOPEN_FIX_LOG(@"mini mode ON via setter");
         axs_fix_afterLayout(self);
     } else {
         objc_setAssociatedObject(self, AxsFixAutoSnapKey, @YES, OBJC_ASSOCIATION_RETAIN);
-        AXS_TROLLOPEN_FIX_LOG(@"mini mode OFF via setter");
     }
 }
 
 static void axs_fix_hookSelector(Class cls, SEL sel, IMP newImp, NSMutableDictionary *map,
-                                NSMutableSet *hooked, NSString *label) {
+                                NSMutableSet *hooked) {
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) {
-        NSString *msg = [NSString stringWithFormat:@"%@: %@ missing", label, NSStringFromSelector(sel)];
-        AXS_TROLLOPEN_FIX_LOG(msg);
-        return;
-    }
+    if (!m) return;
     NSValue *mk = [NSValue valueWithPointer:m];
     if ([hooked containsObject:mk]) return; // 与其他类共享同一个 Method（继承），已挂过
     [hooked addObject:mk];
     IMP orig = method_getImplementation(m);
     method_setImplementation(m, newImp);
     map[[NSValue valueWithNonretainedObject:(id)cls]] = [NSValue valueWithPointer:(void *)orig];
-    NSString *msg = [NSString stringWithFormat:@"hooked %@ on %@", NSStringFromSelector(sel), label];
-    AXS_TROLLOPEN_FIX_LOG(msg);
 }
 
 // 对浮窗类（及其 TOJB 祖先链）挂钩点：只挂"类自己声明"的方法
 static void axs_fix_hookOneClass(Class cls) {
     if (!cls) return;
-    NSString *label = NSStringFromClass(cls);
     SEL miniSel = NSSelectorFromString(@"setMiniWindowModeEnabled:");
     if (axs_fix_classDeclaresMethod(cls, miniSel))
         axs_fix_hookSelector(cls, miniSel, (IMP)axs_fix_new_setMiniWindowModeEnabled,
-                             axs_fix_mapMiniMode, axs_fix_miniModeMethods, label);
+                             axs_fix_mapMiniMode, axs_fix_miniModeMethods);
     if (axs_fix_classDeclaresMethod(cls, @selector(layoutSubviews)))
         axs_fix_hookSelector(cls, @selector(layoutSubviews), (IMP)axs_fix_new_layoutSubviews,
-                             axs_fix_mapLayout, axs_fix_layoutMethods, label);
+                             axs_fix_mapLayout, axs_fix_layoutMethods);
     if (axs_fix_classDeclaresMethod(cls, @selector(setCenter:)))
         axs_fix_hookSelector(cls, @selector(setCenter:), (IMP)axs_fix_new_setCenter,
-                             axs_fix_mapCenter, axs_fix_setCenterMethods, label);
+                             axs_fix_mapCenter, axs_fix_setCenterMethods);
     if (axs_fix_classDeclaresMethod(cls, @selector(setFrame:)))
         axs_fix_hookSelector(cls, @selector(setFrame:), (IMP)axs_fix_new_setFrame,
-                             axs_fix_mapFrame, axs_fix_setFrameMethods, label);
+                             axs_fix_mapFrame, axs_fix_setFrameMethods);
 }
 
 // 枚举 TrollOpenJB 镜像里的类：
@@ -670,31 +621,17 @@ static void axs_fix_discoverMiniModeClasses(void) {
         const char *nm = _dyld_get_image_name(i);
         if (nm && strstr(nm, "TrollOpenJB.dylib")) { imgPath = nm; break; }
     }
-    if (!imgPath) {
-        AXS_TROLLOPEN_FIX_LOG(@"TrollOpenJB image not found for discovery");
-        return;
-    }
+    if (!imgPath) return;
     unsigned int cnt = 0;
     const char **names = objc_copyClassNamesForImage(imgPath, &cnt);
     if (!names) return;
-    int ownerCount = 0;
-    int viewHookCount = 0;
     SEL setterSel = NSSelectorFromString(@"setMiniWindowModeEnabled:");
     SEL layoutSel = @selector(layoutSubviews);
     for (unsigned int i = 0; i < cnt; i++) {
         Class c = objc_getClass(names[i]);
         if (!c) continue;
         if (axs_fix_classDeclaresMethod(c, setterSel)) {
-            BOOL isView = NO;
-            for (Class s = c; s; s = class_getSuperclass(s)) {
-                if (s == [UIView class]) { isView = YES; break; }
-            }
-            NSString *label = NSStringFromClass(c);
-            if (!isView) label = [label stringByAppendingString:@" (non-view)"];
-            NSString *msg = [NSString stringWithFormat:@"mini-mode setter owner: %@", label];
-            AXS_TROLLOPEN_FIX_LOG(msg);
             axs_fix_hookOneClass(c);
-            ownerCount++;
         }
         // 第二遍：TOJB 视图类声明了 layoutSubviews 且类自身声明了浮窗特征方法（严格匹配，避免误伤内部子视图类）
         if (axs_fix_classDeclaresMethod(c, layoutSel)
@@ -702,20 +639,15 @@ static void axs_fix_discoverMiniModeClasses(void) {
                 || axs_fix_classDeclaresMethod(c, NSSelectorFromString(@"bundleID"))
                 || axs_fix_classDeclaresMethod(c, NSSelectorFromString(@"closeWindowWithoutTerminatingProcessImmediately")))) {
             axs_fix_hookOneClass(c);
-            viewHookCount++;
         }
     }
     free(names);
-    NSString *msg = [NSString stringWithFormat:@"discovery done: setter owners=%d layout candidates=%d",
-                     ownerCount, viewHookCount];
-    AXS_TROLLOPEN_FIX_LOG(msg);
 }
 
 static void axs_trollopenfix_hookFloatingWindowSetup(void) {
     axs_fix_initState();
     Class base = axs_trollopenfix_floatingWindowClass();
     if (base) {
-        AXS_TROLLOPEN_FIX_LOG(@"TOJBClass012 found");
         axs_fix_hookOneClass(base);
         // 祖先链上的 TOJB 类也可能声明 layoutSubviews / setCenter:
         Class s = class_getSuperclass(base);
@@ -727,8 +659,6 @@ static void axs_trollopenfix_hookFloatingWindowSetup(void) {
             s = class_getSuperclass(s);
             depth++;
         }
-    } else {
-        AXS_TROLLOPEN_FIX_LOG(@"TOJBClass012 NOT found");
     }
     axs_fix_discoverMiniModeClasses();
 }
@@ -736,9 +666,8 @@ static void axs_trollopenfix_hookFloatingWindowSetup(void) {
 %ctor {
     @autoreleasepool {
         [AxsTrollOpenFixConfig axs_trollopenfix_shared];
-        NSString *pn = [[NSProcessInfo processInfo] processName];
-        NSString *ctorMsg = [NSString stringWithFormat:@"ctor loaded in %@", pn];
-        AXS_TROLLOPEN_FIX_LOG(ctorMsg);
+        // 清理历史日志文件，此后不再产生任何日志
+        [[NSFileManager defaultManager] removeItemAtPath:@"/var/mobile/TrollOpenFix.log" error:nil];
         dispatch_async(dispatch_get_main_queue(), ^{
             axs_trollopenfix_hookFloatingWindowSetup();
             axs_trollopenfix_hookRouteMethods();
