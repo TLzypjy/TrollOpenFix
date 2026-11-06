@@ -571,19 +571,17 @@ __attribute__((unused)) static BOOL axs_trollopenfix_toolIsOn(NSString *identifi
 }
 
 // 在菜单图标加载完成后，遍历条目并按 stateEnabled 替换 iconImage。
-// 通过 ivar 名称直接访问（TOJBClass031 的 ivar 名未被加密）。
+// BOOL ivar 用直接内存偏移读取（object_getIvar 对非对象类型是未定义行为）。
 static void axs_trollopenfix_applyMenuStateIcons(id manager) {
     if (!manager) return;
     Class itemCls = objc_getClass("TOJBClass031");
     if (!itemCls) return;
 
-    // 按名称查找 ivar
     static Ivar iv_items, iv_stateful, iv_runtime, iv_enabled, iv_identifier, iv_iconImage;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         Class mgrCls = objc_getClass("TOJBClass004");
         Class mgrCls2 = objc_getClass("TOJBClass009");
-        // 两个管理类都可能，尝试按 _items 名称查找
         iv_items = class_getInstanceVariable(mgrCls, "_items");
         if (!iv_items && mgrCls2) iv_items = class_getInstanceVariable(mgrCls2, "_items");
         iv_stateful = class_getInstanceVariable(itemCls, "_stateful");
@@ -599,15 +597,25 @@ static void axs_trollopenfix_applyMenuStateIcons(id manager) {
     id items = object_getIvar(manager, iv_items);
     if (![items isKindOfClass:[NSArray class]]) return;
 
+    // 预计算 BOOL ivar 的内存偏移
+    static ptrdiff_t off_stateful, off_runtime, off_enabled;
+    static dispatch_once_t off_once;
+    dispatch_once(&off_once, ^{
+        off_stateful = ivar_getOffset(iv_stateful);
+        off_runtime = ivar_getOffset(iv_runtime);
+        off_enabled = ivar_getOffset(iv_enabled);
+    });
+
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL dirty = NO;
     for (id item in items) {
         if (![item isKindOfClass:itemCls]) continue;
         @try {
-            BOOL stateful = object_getIvar(item, iv_stateful) ? [(id)object_getIvar(item, iv_stateful) boolValue] : NO;
-            BOOL runtime = object_getIvar(item, iv_runtime) ? [(id)object_getIvar(item, iv_runtime) boolValue] : NO;
+            char *base = (__bridge char *)item;
+            BOOL stateful = base[off_stateful] != 0;
+            BOOL runtime = base[off_runtime] != 0;
             if (!stateful || !runtime) continue;
-            BOOL enabled = object_getIvar(item, iv_enabled) ? [(id)object_getIvar(item, iv_enabled) boolValue] : NO;
+            BOOL enabled = base[off_enabled] != 0;
             id identObj = object_getIvar(item, iv_identifier);
             if (![identObj isKindOfClass:[NSString class]] || ![identObj length]) continue;
             NSString *identifier = identObj;
@@ -625,7 +633,6 @@ static void axs_trollopenfix_applyMenuStateIcons(id manager) {
         }
     }
     if (dirty) {
-        // 触发 collectionView 刷新
         @try {
             Ivar cvIvar = class_getInstanceVariable(object_getClass(manager), "_collectionView");
             if (!cvIvar) cvIvar = class_getInstanceVariable(object_getClass(manager), "_menuCollectionView");
