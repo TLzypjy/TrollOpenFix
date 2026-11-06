@@ -611,7 +611,7 @@ static void axs_trollopenfix_applyMenuStateIcons(id manager) {
     for (id item in items) {
         if (![item isKindOfClass:itemCls]) continue;
         @try {
-            char *base = (__bridge char *)item;
+            char *base = (char *)(__bridge void *)item;
             BOOL stateful = base[off_stateful] != 0;
             BOOL runtime = base[off_runtime] != 0;
             if (!stateful || !runtime) continue;
