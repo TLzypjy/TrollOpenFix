@@ -198,11 +198,76 @@ static void axs_trollopenfix_processRoutePair(NSString *source, NSString *target
 
 #pragma mark - 路由事件提取
 
-#pragma mark - 小窗贴边
+#pragma mark - 小窗手势 + 贴边
 
 static char axs_trollopenfix_snapTokenKey;
+static char axs_trollopenfix_dragStartKey;
 
-static void axs_trollopenfix_snapMiniWindow(id win) {
+// 检测系统工具当前状态
+static BOOL axs_trollopenfix_toolIsOn(NSString *identifier) {
+    if ([identifier hasPrefix:@"ScreenRecord"]) {
+        Class cls = objc_getClass("RPScreenRecorder");
+        if (cls) {
+            id recorder = ((id(*)(id, SEL))objc_msgSend)((id)cls, @selector(sharedRecorder));
+            SEL recSel = @selector(isRecording);
+            if (recorder && [recorder respondsToSelector:recSel]) {
+                return ((BOOL(*)(id, SEL))objc_msgSend)(recorder, recSel);
+            }
+        }
+        return NO;
+    }
+    if ([identifier hasPrefix:@"VPN"] || [identifier isEqualToString:@"ToggleVPN"]) {
+        Class cls = objc_getClass("NEVPNManager");
+        if (cls) {
+            id mgr = ((id(*)(id, SEL))objc_msgSend)((id)cls, @selector(sharedManager));
+            SEL connSel = @selector(isConnected);
+            if (mgr && [mgr respondsToSelector:connSel]) {
+                return ((BOOL(*)(id, SEL))objc_msgSend)(mgr, connSel);
+            }
+        }
+        return NO;
+    }
+    return NO;
+}
+
+static void axs_trollopenfix_snapToEdge(id win, BOOL left) {
+    UIView *view = win;
+    CGRect screen = view.window ? view.window.bounds : [UIScreen mainScreen].bounds;
+    CGRect frame = view.frame;
+    CGFloat margin = 8.0;
+    CGFloat w = CGRectGetWidth(frame);
+    CGFloat halfH = CGRectGetHeight(frame) / 2.0;
+    CGFloat targetX = left
+        ? CGRectGetMinX(screen) + margin + w / 2.0
+        : CGRectGetMaxX(screen) - margin - w / 2.0;
+    CGFloat targetY = MIN(MAX(view.center.y, CGRectGetMinY(screen) + margin + halfH),
+                          CGRectGetMaxY(screen) - margin - halfH);
+    [UIView animateWithDuration:0.15 delay:0
+        options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
+        animations:^{ view.center = CGPointMake(targetX, targetY); }
+        completion:nil];
+}
+
+static void axs_trollopenfix_exitMiniMode(id win) {
+    SEL sel = NSSelectorFromString(@"setMiniWindowModeEnabled:");
+    if ([win respondsToSelector:sel]) {
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(win, sel, NO);
+    }
+}
+
+static void axs_trollopenfix_closeFloatingWin(id win) {
+    NSArray *probeNames = @[@"closeWindowWithoutTerminatingProcessImmediately",
+                            @"TOJBMETHOD256", @"TOJBMETHOD254"];
+    for (NSString *name in probeNames) {
+        SEL sel = NSSelectorFromString(name);
+        if ([win respondsToSelector:sel]) {
+            ((void(*)(id, SEL))objc_msgSend)(win, sel);
+            return;
+        }
+    }
+}
+
+static void axs_trollopenfix_snapMiniWindow(id win, CGPoint dragStart) {
     if (!win) return;
     Class cls = axs_trollopenfix_floatingWindowClass();
     if (!cls || ![win isKindOfClass:cls]) return;
@@ -215,38 +280,76 @@ static void axs_trollopenfix_snapMiniWindow(id win) {
     UIView *view = win;
     if (view.hidden || view.alpha < 0.05) return;
 
-    CGRect screen = view.window.bounds;
-    if (screen.size.width <= 0 || screen.size.height <= 0) {
-        screen = [UIScreen mainScreen].bounds;
-    }
-    if (screen.size.width <= 0 || screen.size.height <= 0) return;
-    CGRect frame = view.frame;
-    CGFloat width = CGRectGetWidth(frame);
-    if (width <= 0) return;
+    // 计算拖动位移
+    CGPoint current = view.center;
+    CGFloat dx = current.x - dragStart.x;
+    CGFloat dy = current.y - dragStart.y;
+    CGFloat absDx = fabs(dx);
+    CGFloat absDy = fabs(dy);
 
-    // 往屏幕外滑是快捷关闭手势，不回拉
-    CGFloat outsideLeft = CGRectGetMinX(screen) - CGRectGetMinX(frame);
-    CGFloat outsideRight = CGRectGetMaxX(frame) - CGRectGetMaxX(screen);
-    if (outsideLeft > width * 0.25 || outsideRight > width * 0.25) return;
+    AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"snap: dx=%.1f dy=%.1f", dx, dy]));
+
+    CGFloat swipeThreshold = 30.0;
+    CGFloat tapThreshold = 8.0;
+
+    // 轻点：位移很小 → 全屏打开
+    if (absDx < tapThreshold && absDy < tapThreshold) {
+        AXS_TROLLOPEN_FIX_LOG(@"gesture: tap → fullscreen");
+        axs_trollopenfix_exitMiniMode(win);
+        return;
+    }
+
+    // 上划 → 关闭
+    if (absDy > swipeThreshold && absDy > absDx * 1.3 && dy < 0) {
+        AXS_TROLLOPEN_FIX_LOG(@"gesture: swipe up → close");
+        axs_trollopenfix_closeFloatingWin(win);
+        return;
+    }
+    // 下划 → 全屏
+    if (absDy > swipeThreshold && absDy > absDx * 1.3 && dy > 0) {
+        AXS_TROLLOPEN_FIX_LOG(@"gesture: swipe down → fullscreen");
+        axs_trollopenfix_exitMiniMode(win);
+        return;
+    }
+    // 左划 → 贴左边
+    if (absDx > swipeThreshold && absDx > absDy * 1.3 && dx < 0) {
+        AXS_TROLLOPEN_FIX_LOG(@"gesture: swipe left → snap left");
+        axs_trollopenfix_snapToEdge(win, YES);
+        return;
+    }
+    // 右划 → 贴右边
+    if (absDx > swipeThreshold && absDx > absDy * 1.3 && dx > 0) {
+        AXS_TROLLOPEN_FIX_LOG(@"gesture: swipe right → snap right");
+        axs_trollopenfix_snapToEdge(win, NO);
+        return;
+    }
+
+    // 位移不够大 → 普通贴边（最近的边缘）
+    CGRect screen = view.window ? view.window.bounds : [UIScreen mainScreen].bounds;
+    if (screen.size.width <= 0) return;
+    CGRect frm = view.frame;
+    CGFloat w = CGRectGetWidth(frm);
+    if (w <= 0) return;
+
+    CGFloat outsideL = CGRectGetMinX(screen) - CGRectGetMinX(frm);
+    CGFloat outsideR = CGRectGetMaxX(frm) - CGRectGetMaxX(screen);
+    if (outsideL > w * 0.25 || outsideR > w * 0.25) return;
 
     CGFloat margin = 8.0;
     CGFloat targetX = (view.center.x < CGRectGetMidX(screen))
-        ? CGRectGetMinX(screen) + margin + width / 2.0
-        : CGRectGetMaxX(screen) - margin - width / 2.0;
-    CGFloat halfHeight = CGRectGetHeight(frame) / 2.0;
-    CGFloat targetY = MIN(MAX(view.center.y, CGRectGetMinY(screen) + margin + halfHeight),
-                          CGRectGetMaxY(screen) - margin - halfHeight);
-
+        ? CGRectGetMinX(screen) + margin + w / 2.0
+        : CGRectGetMaxX(screen) - margin - w / 2.0;
+    CGFloat halfH = CGRectGetHeight(frm) / 2.0;
+    CGFloat targetY = MIN(MAX(view.center.y, CGRectGetMinY(screen) + margin + halfH),
+                          CGRectGetMaxY(screen) - margin - halfH);
     if (fabs(targetX - view.center.x) < 1.0 && fabs(targetY - view.center.y) < 1.0) return;
-
-    [UIView animateWithDuration:0.15
-                          delay:0
-                        options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
-                     animations:^{
-        view.center = CGPointMake(targetX, targetY);
-    } completion:nil];
+    [UIView animateWithDuration:0.15 delay:0
+        options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
+        animations:^{ view.center = CGPointMake(targetX, targetY); }
+        completion:nil];
 }
 
+// 带代际令牌的防抖：拖动中不触发，最后一次 setCenter 后 30ms 触发。
 static void axs_trollopenfix_scheduleMiniSnap(id win) {
     if (!win) return;
     NSInteger generation = [objc_getAssociatedObject(win, &axs_trollopenfix_snapTokenKey) integerValue] + 1;
@@ -257,7 +360,9 @@ static void axs_trollopenfix_scheduleMiniSnap(id win) {
             return;
         }
         objc_setAssociatedObject(win, &axs_trollopenfix_snapTokenKey, nil, OBJC_ASSOCIATION_RETAIN);
-        axs_trollopenfix_snapMiniWindow(win);
+        CGPoint dragStart = [objc_getAssociatedObject(win, &axs_trollopenfix_dragStartKey) CGPointValue];
+        axs_trollopenfix_snapMiniWindow(win, dragStart);
+        objc_setAssociatedObject(win, &axs_trollopenfix_dragStartKey, nil, OBJC_ASSOCIATION_RETAIN);
     });
 }
 
@@ -283,6 +388,12 @@ static void axs_trollopenfix_new_setMiniWindowModeEnabled(id self, SEL _cmd, BOO
 static void axs_trollopenfix_new_setCenter(id self, SEL _cmd, CGPoint center) {
     axs_trollopenfix_orig_setCenter(self, _cmd, center);
     if (axs_trollopenfix_enabled() && axs_trollopenfix_miniModeEnabled(self)) {
+        // 记录拖动起点（第一次 setCenter 时）
+        NSValue *start = objc_getAssociatedObject(self, &axs_trollopenfix_dragStartKey);
+        if (!start) {
+            objc_setAssociatedObject(self, &axs_trollopenfix_dragStartKey,
+                [NSValue valueWithCGPoint:center], OBJC_ASSOCIATION_RETAIN);
+        }
         axs_trollopenfix_scheduleMiniSnap(self);
     }
 }
