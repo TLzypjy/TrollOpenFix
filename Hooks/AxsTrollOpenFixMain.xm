@@ -198,63 +198,6 @@ static void axs_trollopenfix_processRoutePair(NSString *source, NSString *target
 
 #pragma mark - 路由事件提取
 
-static void axs_trollopenfix_handleRouteEvent(id request, id options, id activationSettings,
-                                              id origin, id urlCandidate) {
-    if (!axs_trollopenfix_enabled()) return;
-
-    NSString *source = axs_trollopenfix_extractBundleID(origin);
-    if (!source && options) {
-        SEL orgSel = NSSelectorFromString(@"originator");
-        Class cls = object_getClass(options);
-        if (cls && [(id)cls respondsToSelector:orgSel]) {
-            Method m = class_getInstanceMethod(cls, orgSel);
-            if (m && method_getTypeEncoding(m)[0] == '@') {
-                id org = ((id(*)(id, SEL))objc_msgSend)(options, orgSel);
-                source = axs_trollopenfix_extractBundleID(org);
-            }
-        }
-    }
-    if (!source) source = axs_trollopenfix_extractBundleID(options);
-    NSString *target = axs_trollopenfix_extractBundleID(request);
-    if (!target) target = axs_trollopenfix_extractBundleID(activationSettings);
-
-    NSString *urlString = nil;
-    for (NSString *key in @[@"URL", @"url"]) {
-        SEL sel = NSSelectorFromString(key);
-        Class cls = object_getClass(request);
-        if (!request || !cls || ![(id)cls respondsToSelector:sel]) continue;
-        Method m = class_getInstanceMethod(cls, sel);
-        if (!m || method_getTypeEncoding(m)[0] != '@') continue;
-        id u = ((id(*)(id, SEL))objc_msgSend)(request, sel);
-        if ([u isKindOfClass:[NSURL class]]) urlString = [(NSURL *)u absoluteString];
-        else if ([u isKindOfClass:[NSString class]]) urlString = u;
-        if (urlString) break;
-    }
-    if (!urlString) {
-        for (NSString *key in @[@"URL", @"url"]) {
-            SEL sel = NSSelectorFromString(key);
-            Class cls = object_getClass(request);
-            if (!request || !cls || ![(id)cls respondsToSelector:sel]) continue;
-            Method m = class_getInstanceMethod(cls, sel);
-            if (!m || method_getTypeEncoding(m)[0] != '@') continue;
-            id u = ((id(*)(id, SEL))objc_msgSend)(request, sel);
-            if ([u isKindOfClass:[NSURL class]]) urlString = [(NSURL *)u absoluteString];
-            else if ([u isKindOfClass:[NSString class]]) urlString = u;
-            if (urlString) break;
-        }
-    }
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @try {
-            NSString *t = target ?: axs_trollopenfix_frontmostIdentifier();
-            axs_trollopenfix_processRoutePair(source, t);
-        } @catch (NSException *e) {
-            NSLog(@"[TrollOpenFix] deferred route exception (suppressed)");
-        }
-    });
-}
-
 #pragma mark - 小窗贴边
 
 static char axs_trollopenfix_snapTokenKey;
