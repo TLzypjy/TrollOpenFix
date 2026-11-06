@@ -263,14 +263,6 @@ static void axs_trollopenfix_snapMiniWindow(id win, CGPoint dragStart) {
     AXS_TROLLOPEN_FIX_LOG(([NSString stringWithFormat:@"snap: dx=%.1f dy=%.1f", dx, dy]));
 
     CGFloat swipeThreshold = 30.0;
-    CGFloat tapThreshold = 8.0;
-
-    // 轻点：位移很小 → 全屏打开
-    if (absDx < tapThreshold && absDy < tapThreshold) {
-        AXS_TROLLOPEN_FIX_LOG(@"gesture: tap → fullscreen");
-        axs_trollopenfix_exitMiniMode(win);
-        return;
-    }
 
     // 上划 → 关闭
     if (absDy > swipeThreshold && absDy > absDx * 1.3 && dy < 0) {
@@ -355,7 +347,7 @@ static BOOL axs_trollopenfix_miniModeEnabled(id win) {
     CGFloat screenW = view.window.bounds.size.width;
     CGFloat viewW = CGRectGetWidth(view.frame);
     if (screenW <= 0 || viewW <= 0) return NO;
-    return viewW < screenW * 0.55;
+    return viewW < screenW * 0.40;
 }
 
 static void axs_trollopenfix_new_setMiniWindowModeEnabled(id self, SEL _cmd, BOOL value) {
