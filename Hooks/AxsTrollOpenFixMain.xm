@@ -203,33 +203,6 @@ static void axs_trollopenfix_processRoutePair(NSString *source, NSString *target
 static char axs_trollopenfix_snapTokenKey;
 static char axs_trollopenfix_dragStartKey;
 
-// 检测系统工具当前状态
-static BOOL axs_trollopenfix_toolIsOn(NSString *identifier) {
-    if ([identifier hasPrefix:@"ScreenRecord"]) {
-        Class cls = objc_getClass("RPScreenRecorder");
-        if (cls) {
-            id recorder = ((id(*)(id, SEL))objc_msgSend)((id)cls, @selector(sharedRecorder));
-            SEL recSel = @selector(isRecording);
-            if (recorder && [recorder respondsToSelector:recSel]) {
-                return ((BOOL(*)(id, SEL))objc_msgSend)(recorder, recSel);
-            }
-        }
-        return NO;
-    }
-    if ([identifier hasPrefix:@"VPN"] || [identifier isEqualToString:@"ToggleVPN"]) {
-        Class cls = objc_getClass("NEVPNManager");
-        if (cls) {
-            id mgr = ((id(*)(id, SEL))objc_msgSend)((id)cls, @selector(sharedManager));
-            SEL connSel = @selector(isConnected);
-            if (mgr && [mgr respondsToSelector:connSel]) {
-                return ((BOOL(*)(id, SEL))objc_msgSend)(mgr, connSel);
-            }
-        }
-        return NO;
-    }
-    return NO;
-}
-
 static void axs_trollopenfix_snapToEdge(id win, BOOL left) {
     UIView *view = win;
     CGRect screen = view.window ? view.window.bounds : [UIScreen mainScreen].bounds;
