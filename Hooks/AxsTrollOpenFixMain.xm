@@ -243,18 +243,27 @@ static const void *AxsFixPanInstalledKey = &AxsFixPanInstalledKey;
 static const void *AxsFixTouchingKey = &AxsFixTouchingKey;
 static const void *AxsFixAutoSnapKey = &AxsFixAutoSnapKey;
 static const void *AxsFixVerifiedKey = &AxsFixVerifiedKey;
+static const void *AxsFixPendingEntryKey = &AxsFixPendingEntryKey;
 
 static NSMutableDictionary *axs_fix_state;            // panTarget / miniSetterTarget 强引用
 static NSMutableDictionary *axs_fix_mapCenter;        // Class -> 原始 setCenter: IMP
 static NSMutableDictionary *axs_fix_mapFrame;         // Class -> 原始 setFrame: IMP
 static NSMutableDictionary *axs_fix_mapLayout;        // Class -> 原始 layoutSubviews IMP
 static NSMutableDictionary *axs_fix_mapMiniMode;      // Class -> 原始 setMiniWindowModeEnabled: IMP
+static NSMutableDictionary *axs_fix_mapTransition;    // Class -> 原始 setIsTransitioningFromMiniMode: IMP
+static NSMutableDictionary *axs_fix_mapSwapFull;      // Class -> 原始 performMultiScreenSwapToFullscreen IMP
+static NSMutableDictionary *axs_fix_mapSwapFullC;     // Class -> 原始 performMultiScreenSwapToFullscreenWithCompletion: IMP
+static NSMutableDictionary *axs_fix_mapTap;           // Class -> 原始 handleTapGesture: IMP
 static NSMutableSet *axs_fix_setCenterMethods;
 static NSMutableSet *axs_fix_setFrameMethods;
 static NSMutableSet *axs_fix_layoutMethods;
 static NSMutableSet *axs_fix_miniModeMethods;
+static NSMutableSet *axs_fix_transitionMethods;
+static NSMutableSet *axs_fix_swapFullMethods;
+static NSMutableSet *axs_fix_swapFullCMethods;
+static NSMutableSet *axs_fix_tapMethods;
 static BOOL axs_fix_inOwnSnap = NO;                   // 我们自己的贴边动画触发的 setCenter: 不回环处理
-static CFAbsoluteTime axs_fix_transitionUntil = 0;    // 全屏/关闭过渡期间暂停我们的贴边逻辑，避免和原生动画打架
+static CFAbsoluteTime axs_fix_transitionUntil = 0;    // 全屏/分屏过渡期间冻结我们的一切位置干预，避免和原生动画打架导致显示错乱
 
 static void axs_fix_initState(void) {
     static dispatch_once_t once;
@@ -264,11 +273,24 @@ static void axs_fix_initState(void) {
         axs_fix_mapFrame = [NSMutableDictionary dictionary];
         axs_fix_mapLayout = [NSMutableDictionary dictionary];
         axs_fix_mapMiniMode = [NSMutableDictionary dictionary];
+        axs_fix_mapTransition = [NSMutableDictionary dictionary];
+        axs_fix_mapSwapFull = [NSMutableDictionary dictionary];
+        axs_fix_mapSwapFullC = [NSMutableDictionary dictionary];
+        axs_fix_mapTap = [NSMutableDictionary dictionary];
         axs_fix_setCenterMethods = [NSMutableSet set];
         axs_fix_setFrameMethods = [NSMutableSet set];
         axs_fix_layoutMethods = [NSMutableSet set];
         axs_fix_miniModeMethods = [NSMutableSet set];
+        axs_fix_transitionMethods = [NSMutableSet set];
+        axs_fix_swapFullMethods = [NSMutableSet set];
+        axs_fix_swapFullCMethods = [NSMutableSet set];
+        axs_fix_tapMethods = [NSMutableSet set];
     });
+}
+
+static void axs_fix_armFreeze(NSTimeInterval duration) {
+    CFAbsoluteTime until = CFAbsoluteTimeGetCurrent() + duration;
+    if (until > axs_fix_transitionUntil) axs_fix_transitionUntil = until;
 }
 
 // 类自身是否声明了该方法（不查继承链，避免把钩子挂到 UIView 基类上影响整个 SpringBoard）
@@ -465,6 +487,7 @@ static void axs_fix_goFullscreen(id view) {
         return;
     }
     objc_setAssociatedObject(view, AxsFixTouchingKey, @NO, OBJC_ASSOCIATION_RETAIN);
+    if (CFAbsoluteTimeGetCurrent() < axs_fix_transitionUntil) return; // 过渡动画期间不做任何松手处理
     if (!axs_trollopenfix_enabled() || !axs_fix_isMini(view) || !axs_fix_isTargetFloatingView(view)) return;
 
     CGPoint vel = [pan velocityInView:(view.superview ?: view)];
@@ -568,17 +591,70 @@ static void axs_fix_new_layoutSubviews(id self, SEL _cmd) {
     axs_fix_afterLayout(self);
 }
 
+// 进入小窗的贴边不再在缩小动画中途执行（会打乱 TrollOpen 的过渡导致显示错乱），
+// 而是挂起为"待办"，等过渡结束信号（setIsTransitioningFromMiniMode:NO）或超时兜底再执行
+static void axs_fix_firePendingEntrySnap(id self) {
+    if (![objc_getAssociatedObject(self, AxsFixPendingEntryKey) boolValue]) return;
+    objc_setAssociatedObject(self, AxsFixPendingEntryKey, @NO, OBJC_ASSOCIATION_RETAIN);
+    if (!axs_trollopenfix_enabled()) return;
+    axs_fix_transitionUntil = 0; // 兜底执行时解除冻结
+    objc_setAssociatedObject(self, AxsFixAutoSnapKey, @NO, OBJC_ASSOCIATION_RETAIN);
+    axs_fix_afterLayout(self);
+}
+
 static void axs_fix_new_setMiniWindowModeEnabled(id self, SEL _cmd, BOOL value) {
     IMP orig = axs_fix_lookupOrig(self, axs_fix_mapMiniMode);
     if (orig) ((void(*)(id, SEL, BOOL))orig)(self, _cmd, value);
     if (!axs_trollopenfix_enabled()) return;
     if (value) {
         axs_fix_state[@"miniSetterTarget"] = self;
-        objc_setAssociatedObject(self, AxsFixAutoSnapKey, @NO, OBJC_ASSOCIATION_RETAIN);
-        axs_fix_afterLayout(self);
+        objc_setAssociatedObject(self, AxsFixPendingEntryKey, @YES, OBJC_ASSOCIATION_RETAIN);
+        axs_fix_armFreeze(2.5); // 缩小动画期间完全冻结
+        UIView *view = (UIView *)self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (view.window) axs_fix_firePendingEntrySnap(view); // 过渡信号缺失时的兜底
+        });
     } else {
+        objc_setAssociatedObject(self, AxsFixPendingEntryKey, @NO, OBJC_ASSOCIATION_RETAIN);
         objc_setAssociatedObject(self, AxsFixAutoSnapKey, @YES, OBJC_ASSOCIATION_RETAIN);
+        axs_fix_armFreeze(2.5); // 展开动画期间完全冻结
     }
+}
+
+// 过渡状态标志：TrollOpen 原生展开不经过 setMiniWindowModeEnabled:NO（实测），
+// 必须靠这个标志感知过渡的开始与结束
+static void axs_fix_new_setIsTransitioningFromMiniMode(id self, SEL _cmd, BOOL value) {
+    IMP orig = axs_fix_lookupOrig(self, axs_fix_mapTransition);
+    if (orig) ((void(*)(id, SEL, BOOL))orig)(self, _cmd, value);
+    if (!axs_trollopenfix_enabled()) return;
+    if (value) {
+        axs_fix_armFreeze(2.5);
+    } else {
+        axs_fix_transitionUntil = CFAbsoluteTimeGetCurrent(); // 过渡结束，立即解除冻结
+        dispatch_async(dispatch_get_main_queue(), ^{
+            axs_fix_firePendingEntrySnap(self);
+        });
+    }
+}
+
+// 展开/全屏切换入口：进入前先冻结，防止我们的贴边插进过渡动画
+static void axs_fix_new_performSwapFull(id self, SEL _cmd) {
+    if (axs_trollopenfix_enabled()) axs_fix_armFreeze(2.5);
+    IMP orig = axs_fix_lookupOrig(self, axs_fix_mapSwapFull);
+    if (orig) ((void(*)(id, SEL))orig)(self, _cmd);
+}
+
+static void axs_fix_new_performSwapFullC(id self, SEL _cmd, void *completion) {
+    if (axs_trollopenfix_enabled()) axs_fix_armFreeze(2.5);
+    IMP orig = axs_fix_lookupOrig(self, axs_fix_mapSwapFullC);
+    if (orig) ((void(*)(id, SEL, void *))orig)(self, _cmd, completion);
+}
+
+static void axs_fix_new_handleTap(id self, SEL _cmd, id gesture) {
+    if (axs_trollopenfix_enabled()) axs_fix_armFreeze(1.0); // 轻点可能触发小窗展开过渡
+    IMP orig = axs_fix_lookupOrig(self, axs_fix_mapTap);
+    if (orig) ((void(*)(id, SEL, id))orig)(self, _cmd, gesture);
 }
 
 static void axs_fix_hookSelector(Class cls, SEL sel, IMP newImp, NSMutableDictionary *map,
@@ -600,6 +676,22 @@ static void axs_fix_hookOneClass(Class cls) {
     if (axs_fix_classDeclaresMethod(cls, miniSel))
         axs_fix_hookSelector(cls, miniSel, (IMP)axs_fix_new_setMiniWindowModeEnabled,
                              axs_fix_mapMiniMode, axs_fix_miniModeMethods);
+    SEL transSel = NSSelectorFromString(@"setIsTransitioningFromMiniMode:");
+    if (axs_fix_classDeclaresMethod(cls, transSel))
+        axs_fix_hookSelector(cls, transSel, (IMP)axs_fix_new_setIsTransitioningFromMiniMode,
+                             axs_fix_mapTransition, axs_fix_transitionMethods);
+    SEL swapSel = NSSelectorFromString(@"performMultiScreenSwapToFullscreen");
+    if (axs_fix_classDeclaresMethod(cls, swapSel))
+        axs_fix_hookSelector(cls, swapSel, (IMP)axs_fix_new_performSwapFull,
+                             axs_fix_mapSwapFull, axs_fix_swapFullMethods);
+    SEL swapCSel = NSSelectorFromString(@"performMultiScreenSwapToFullscreenWithCompletion:");
+    if (axs_fix_classDeclaresMethod(cls, swapCSel))
+        axs_fix_hookSelector(cls, swapCSel, (IMP)axs_fix_new_performSwapFullC,
+                             axs_fix_mapSwapFullC, axs_fix_swapFullCMethods);
+    SEL tapSel = NSSelectorFromString(@"handleTapGesture:");
+    if (axs_fix_classDeclaresMethod(cls, tapSel))
+        axs_fix_hookSelector(cls, tapSel, (IMP)axs_fix_new_handleTap,
+                             axs_fix_mapTap, axs_fix_tapMethods);
     if (axs_fix_classDeclaresMethod(cls, @selector(layoutSubviews)))
         axs_fix_hookSelector(cls, @selector(layoutSubviews), (IMP)axs_fix_new_layoutSubviews,
                              axs_fix_mapLayout, axs_fix_layoutMethods);
@@ -613,7 +705,8 @@ static void axs_fix_hookOneClass(Class cls) {
 
 // 枚举 TrollOpenJB 镜像里的类：
 // 第一遍找 setMiniWindowModeEnabled: 的真实声明类；
-// 第二遍找声明了 layoutSubviews 且带浮窗特征的 TOJB 视图类（兜底，保证一定能拿到浮窗实例）
+// 第二遍找声明了 layoutSubviews 且带浮窗特征的 TOJB 视图类（兜底，保证一定能拿到浮窗实例）；
+// 第三遍找过渡相关方法（setIsTransitioningFromMiniMode: / performMultiScreenSwap* / handleTapGesture:）的声明类
 static void axs_fix_discoverMiniModeClasses(void) {
     const char *imgPath = NULL;
     NSUInteger n = _dyld_image_count();
@@ -627,10 +720,18 @@ static void axs_fix_discoverMiniModeClasses(void) {
     if (!names) return;
     SEL setterSel = NSSelectorFromString(@"setMiniWindowModeEnabled:");
     SEL layoutSel = @selector(layoutSubviews);
+    SEL transSel = NSSelectorFromString(@"setIsTransitioningFromMiniMode:");
+    SEL swapSel = NSSelectorFromString(@"performMultiScreenSwapToFullscreen");
+    SEL tapSel = NSSelectorFromString(@"handleTapGesture:");
     for (unsigned int i = 0; i < cnt; i++) {
         Class c = objc_getClass(names[i]);
         if (!c) continue;
         if (axs_fix_classDeclaresMethod(c, setterSel)) {
+            axs_fix_hookOneClass(c);
+        }
+        if (axs_fix_classDeclaresMethod(c, transSel)
+            || axs_fix_classDeclaresMethod(c, swapSel)
+            || axs_fix_classDeclaresMethod(c, tapSel)) {
             axs_fix_hookOneClass(c);
         }
         // 第二遍：TOJB 视图类声明了 layoutSubviews 且类自身声明了浮窗特征方法（严格匹配，避免误伤内部子视图类）
