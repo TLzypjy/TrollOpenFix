@@ -13,6 +13,27 @@
 // 3) 小窗手势：上划关闭 / 下划全屏 / 左划贴左 / 右划贴右（被动 Pan，不影响原生拖动）
 // 性能：无任何日志输出；每实例只做一次浮窗身份校验；Pan 状态转换时才写关联对象
 
+// 调试日志：默认完全关闭（零开销）；仅当存在 /var/mobile/TrollOpenFixDebug 标记文件时
+// 才把事件写入 /var/mobile/TrollOpenFix.log（用 Filza 创建/删除标记即可实时开关，无需注销）
+static void axs_fix_dbg(NSString *msg) {
+    @try {
+        static NSFileManager *fm;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ fm = [NSFileManager defaultManager]; });
+        if (![fm fileExistsAtPath:@"/var/mobile/TrollOpenFixDebug"]) return;
+        static NSDateFormatter *fmt;
+        static dispatch_once_t once2;
+        dispatch_once(&once2, ^{
+            fmt = [[NSDateFormatter alloc] init];
+            fmt.dateFormat = @"MM-dd HH:mm:ss.SSS";
+        });
+        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], msg];
+        const char *s = line.UTF8String;
+        FILE *f = fopen("/var/mobile/TrollOpenFix.log", "a");
+        if (f) { fwrite(s, 1, strlen(s), f); fclose(f); }
+    } @catch (NSException *e) {}
+}
+
 static BOOL axs_trollopenfix_enabled(void) {
     return [[AxsTrollOpenFixConfig axs_trollopenfix_shared] axs_trollopenfix_isEnabled];
 }
@@ -381,6 +402,19 @@ static void axs_fix_settleSnap(UIView *view, NSInteger attempt) {
     });
 }
 
+// 过渡结束后强制刷新一次浮窗布局，尝试纠正 TrollOpen 过渡动画可能留下的内容错位
+static void axs_fix_scheduleLayoutRefresh(UIView *view) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!view.window) return;
+        axs_fix_dbg(@"layout refresh");
+        axs_fix_inOwnSnap = YES; // 刷新触发的布局回调不再触发我们的贴边逻辑
+        [view setNeedsLayout];
+        [view layoutIfNeeded];
+        axs_fix_inOwnSnap = NO;
+    });
+}
+
 static BOOL axs_fix_closeWindow(id primary) {
     if (axs_trollopenfix_closeFloatingWindow(primary)) return YES;
     id target = axs_fix_state[@"miniSetterTarget"];
@@ -487,7 +521,10 @@ static void axs_fix_goFullscreen(id view) {
         return;
     }
     objc_setAssociatedObject(view, AxsFixTouchingKey, @NO, OBJC_ASSOCIATION_RETAIN);
-    if (CFAbsoluteTimeGetCurrent() < axs_fix_transitionUntil) return; // 过渡动画期间不做任何松手处理
+    if (CFAbsoluteTimeGetCurrent() < axs_fix_transitionUntil) {
+        axs_fix_dbg(@"pan release skipped (transition freeze)");
+        return; // 过渡动画期间不做任何松手处理
+    }
     if (!axs_trollopenfix_enabled() || !axs_fix_isMini(view) || !axs_fix_isTargetFloatingView(view)) return;
 
     CGPoint vel = [pan velocityInView:(view.superview ?: view)];
@@ -506,16 +543,26 @@ static void axs_fix_goFullscreen(id view) {
 
     if (vertical) {
         if (vel.y < 0) {
+            NSString *msg = [NSString stringWithFormat:@"flick up (%.0fpt/s) -> close", avy];
+            axs_fix_dbg(msg);
             axs_fix_closeWindow(view);
         } else {
+            NSString *msg = [NSString stringWithFormat:@"flick down (%.0fpt/s) -> fullscreen", avy];
+            axs_fix_dbg(msg);
             axs_fix_goFullscreen(view);
         }
         return;
     }
     if (horizontal) {
+        NSString *msg = [NSString stringWithFormat:@"flick %@ (%.0fpt/s) -> snap edge",
+                         vel.x < 0 ? @"left" : @"right", avx];
+        axs_fix_dbg(msg);
         axs_fix_snapEdge(view, vel.x < 0);
         return;
     }
+    NSString *msg = [NSString stringWithFormat:@"drag release (vx=%.0f vy=%.0f dx=%.0f dy=%.0f) -> snap nearest edge",
+                     vel.x, vel.y, trans.x, trans.y];
+    axs_fix_dbg(msg);
     axs_fix_snapNearest(view);
     axs_fix_settleSnap(view, 0);
 }
@@ -555,6 +602,7 @@ static void axs_fix_afterLayout(id self) {
     if ([objc_getAssociatedObject(view, AxsFixTouchingKey) boolValue]) return;
     if ([objc_getAssociatedObject(view, AxsFixAutoSnapKey) boolValue]) return;
     objc_setAssociatedObject(view, AxsFixAutoSnapKey, @YES, OBJC_ASSOCIATION_RETAIN);
+    axs_fix_dbg(@"auto snap scheduled");
     axs_fix_settleSnap(view, 0);
 }
 
@@ -596,9 +644,10 @@ static void axs_fix_new_layoutSubviews(id self, SEL _cmd) {
 static void axs_fix_firePendingEntrySnap(id self) {
     if (![objc_getAssociatedObject(self, AxsFixPendingEntryKey) boolValue]) return;
     objc_setAssociatedObject(self, AxsFixPendingEntryKey, @NO, OBJC_ASSOCIATION_RETAIN);
-    if (!axs_trollopenfix_enabled()) return;
+    if (!axs_trollopenfix_enabled()) { axs_fix_dbg(@"entry snap: disabled"); return; }
     axs_fix_transitionUntil = 0; // 兜底执行时解除冻结
     objc_setAssociatedObject(self, AxsFixAutoSnapKey, @NO, OBJC_ASSOCIATION_RETAIN);
+    axs_fix_dbg(@"entry snap fired");
     axs_fix_afterLayout(self);
 }
 
@@ -607,6 +656,7 @@ static void axs_fix_new_setMiniWindowModeEnabled(id self, SEL _cmd, BOOL value) 
     if (orig) ((void(*)(id, SEL, BOOL))orig)(self, _cmd, value);
     if (!axs_trollopenfix_enabled()) return;
     if (value) {
+        axs_fix_dbg(@"mini setter YES (shrink start)");
         axs_fix_state[@"miniSetterTarget"] = self;
         objc_setAssociatedObject(self, AxsFixPendingEntryKey, @YES, OBJC_ASSOCIATION_RETAIN);
         axs_fix_armFreeze(2.5); // 缩小动画期间完全冻结
@@ -615,10 +665,13 @@ static void axs_fix_new_setMiniWindowModeEnabled(id self, SEL _cmd, BOOL value) 
                        dispatch_get_main_queue(), ^{
             if (view.window) axs_fix_firePendingEntrySnap(view); // 过渡信号缺失时的兜底
         });
+        axs_fix_scheduleLayoutRefresh(view);
     } else {
+        axs_fix_dbg(@"mini setter NO (expand start)");
         objc_setAssociatedObject(self, AxsFixPendingEntryKey, @NO, OBJC_ASSOCIATION_RETAIN);
         objc_setAssociatedObject(self, AxsFixAutoSnapKey, @YES, OBJC_ASSOCIATION_RETAIN);
         axs_fix_armFreeze(2.5); // 展开动画期间完全冻结
+        axs_fix_scheduleLayoutRefresh((UIView *)self);
     }
 }
 
@@ -629,30 +682,45 @@ static void axs_fix_new_setIsTransitioningFromMiniMode(id self, SEL _cmd, BOOL v
     if (orig) ((void(*)(id, SEL, BOOL))orig)(self, _cmd, value);
     if (!axs_trollopenfix_enabled()) return;
     if (value) {
+        axs_fix_dbg(@"transition YES");
         axs_fix_armFreeze(2.5);
     } else {
+        axs_fix_dbg(@"transition NO");
         axs_fix_transitionUntil = CFAbsoluteTimeGetCurrent(); // 过渡结束，立即解除冻结
         dispatch_async(dispatch_get_main_queue(), ^{
             axs_fix_firePendingEntrySnap(self);
         });
+        axs_fix_scheduleLayoutRefresh((UIView *)self);
     }
 }
 
 // 展开/全屏切换入口：进入前先冻结，防止我们的贴边插进过渡动画
 static void axs_fix_new_performSwapFull(id self, SEL _cmd) {
-    if (axs_trollopenfix_enabled()) axs_fix_armFreeze(2.5);
+    if (axs_trollopenfix_enabled()) {
+        axs_fix_dbg(@"performSwap start");
+        axs_fix_armFreeze(2.5);
+        axs_fix_scheduleLayoutRefresh((UIView *)self);
+    }
     IMP orig = axs_fix_lookupOrig(self, axs_fix_mapSwapFull);
     if (orig) ((void(*)(id, SEL))orig)(self, _cmd);
 }
 
 static void axs_fix_new_performSwapFullC(id self, SEL _cmd, void *completion) {
-    if (axs_trollopenfix_enabled()) axs_fix_armFreeze(2.5);
+    if (axs_trollopenfix_enabled()) {
+        axs_fix_dbg(@"performSwapC start");
+        axs_fix_armFreeze(2.5);
+        axs_fix_scheduleLayoutRefresh((UIView *)self);
+    }
     IMP orig = axs_fix_lookupOrig(self, axs_fix_mapSwapFullC);
     if (orig) ((void(*)(id, SEL, void *))orig)(self, _cmd, completion);
 }
 
 static void axs_fix_new_handleTap(id self, SEL _cmd, id gesture) {
-    if (axs_trollopenfix_enabled()) axs_fix_armFreeze(1.0); // 轻点可能触发小窗展开过渡
+    if (axs_trollopenfix_enabled()) {
+        axs_fix_dbg(@"handleTap");
+        axs_fix_armFreeze(1.0); // 轻点可能触发小窗展开过渡
+        axs_fix_scheduleLayoutRefresh((UIView *)self);
+    }
     IMP orig = axs_fix_lookupOrig(self, axs_fix_mapTap);
     if (orig) ((void(*)(id, SEL, id))orig)(self, _cmd, gesture);
 }
@@ -667,6 +735,9 @@ static void axs_fix_hookSelector(Class cls, SEL sel, IMP newImp, NSMutableDictio
     IMP orig = method_getImplementation(m);
     method_setImplementation(m, newImp);
     map[[NSValue valueWithNonretainedObject:(id)cls]] = [NSValue valueWithPointer:(void *)orig];
+    NSString *msg = [NSString stringWithFormat:@"hooked %@ on %@",
+                     NSStringFromSelector(sel), NSStringFromClass(cls)];
+    axs_fix_dbg(msg);
 }
 
 // 对浮窗类（及其 TOJB 祖先链）挂钩点：只挂"类自己声明"的方法
@@ -767,8 +838,9 @@ static void axs_trollopenfix_hookFloatingWindowSetup(void) {
 %ctor {
     @autoreleasepool {
         [AxsTrollOpenFixConfig axs_trollopenfix_shared];
-        // 清理历史日志文件，此后不再产生任何日志
+        // 清理历史日志文件（调试日志默认关闭，仅当存在 /var/mobile/TrollOpenFixDebug 标记才写）
         [[NSFileManager defaultManager] removeItemAtPath:@"/var/mobile/TrollOpenFix.log" error:nil];
+        axs_fix_dbg(@"ctor SpringBoard");
         dispatch_async(dispatch_get_main_queue(), ^{
             axs_trollopenfix_hookFloatingWindowSetup();
             axs_trollopenfix_hookRouteMethods();
